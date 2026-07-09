@@ -211,6 +211,9 @@ show_usage() {
     echo "  --input-type TYPE       Set the input type (default: zmq_manager)"
     echo "  --output-type TYPE      Set the output type (default: ros2)"
     echo "  --zmq-host HOST         Set the ZMQ host (default: localhost)"
+    echo "  --enable-motion-recording  Record ZMQ/planner motions to reference/recorded_motion/"
+    echo "  --enable-csv-logs      Record measured robot/sim state CSV logs"
+    echo "  --logs-dir PATH        Set CSV logs output directory"
     echo ""
     echo "Interface modes:"
     echo "  sim              Use loopback interface for simulation (MuJoCo)"
@@ -251,6 +254,7 @@ MOTION_DATA="$MOTION_DATA_DEFAULT"
 INPUT_TYPE="$INPUT_TYPE_DEFAULT"
 OUTPUT_TYPE="$OUTPUT_TYPE_DEFAULT"
 ZMQ_HOST="$ZMQ_HOST_DEFAULT"
+USER_EXTRA_ARGS=""
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -313,6 +317,22 @@ while [[ $# -gt 0 ]]; do
                 exit 1
             fi
             ZMQ_HOST="$2"
+            shift 2
+            ;;
+        --enable-motion-recording)
+            USER_EXTRA_ARGS="$USER_EXTRA_ARGS --enable-motion-recording"
+            shift
+            ;;
+        --enable-csv-logs)
+            USER_EXTRA_ARGS="$USER_EXTRA_ARGS --enable-csv-logs"
+            shift
+            ;;
+        --logs-dir)
+            if [[ -z "$2" ]]; then
+                echo -e "${RED}Error: --logs-dir requires a path argument${NC}" >&2
+                exit 1
+            fi
+            USER_EXTRA_ARGS="$USER_EXTRA_ARGS --logs-dir $2"
             shift 2
             ;;
         sim|real)
@@ -380,9 +400,9 @@ CHECKPOINT_ENCODER="${CHECKPOINT}_encoder.onnx"
 # ZMQ_HOST is already set from argument parsing above
 
 # Additional flags for simulation mode
-EXTRA_ARGS=""
+EXTRA_ARGS="$USER_EXTRA_ARGS"
 if [[ "$ENV_TYPE" == "sim" ]]; then
-    EXTRA_ARGS="--disable-crc-check"
+    EXTRA_ARGS="$EXTRA_ARGS --disable-crc-check"
     echo -e "${YELLOW}📋 Simulation mode: CRC check will be disabled${NC}"
     echo ""
 fi
