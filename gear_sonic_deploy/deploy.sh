@@ -212,8 +212,6 @@ show_usage() {
     echo "  --output-type TYPE      Set the output type (default: ros2)"
     echo "  --zmq-host HOST         Set the ZMQ host (default: localhost)"
     echo "  --enable-motion-recording  Record ZMQ/planner motions to reference/recorded_motion/"
-    echo "  --enable-csv-logs      Record measured robot/sim state CSV logs"
-    echo "  --logs-dir PATH        Set CSV logs output directory"
     echo ""
     echo "Interface modes:"
     echo "  sim              Use loopback interface for simulation (MuJoCo)"
@@ -322,18 +320,6 @@ while [[ $# -gt 0 ]]; do
         --enable-motion-recording)
             USER_EXTRA_ARGS="$USER_EXTRA_ARGS --enable-motion-recording"
             shift
-            ;;
-        --enable-csv-logs)
-            USER_EXTRA_ARGS="$USER_EXTRA_ARGS --enable-csv-logs"
-            shift
-            ;;
-        --logs-dir)
-            if [[ -z "$2" ]]; then
-                echo -e "${RED}Error: --logs-dir requires a path argument${NC}" >&2
-                exit 1
-            fi
-            USER_EXTRA_ARGS="$USER_EXTRA_ARGS --logs-dir $2"
-            shift 2
             ;;
         sim|real)
             INTERFACE_MODE="$1"
