@@ -252,7 +252,7 @@ MOTION_DATA="$MOTION_DATA_DEFAULT"
 INPUT_TYPE="$INPUT_TYPE_DEFAULT"
 OUTPUT_TYPE="$OUTPUT_TYPE_DEFAULT"
 ZMQ_HOST="$ZMQ_HOST_DEFAULT"
-USER_EXTRA_ARGS=""
+EXTRA_ARGS=""
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -318,7 +318,7 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --enable-motion-recording)
-            USER_EXTRA_ARGS="$USER_EXTRA_ARGS --enable-motion-recording"
+            EXTRA_ARGS="$EXTRA_ARGS --enable-motion-recording"
             shift
             ;;
         sim|real)
@@ -386,7 +386,6 @@ CHECKPOINT_ENCODER="${CHECKPOINT}_encoder.onnx"
 # ZMQ_HOST is already set from argument parsing above
 
 # Additional flags for simulation mode
-EXTRA_ARGS="$USER_EXTRA_ARGS"
 if [[ "$ENV_TYPE" == "sim" ]]; then
     EXTRA_ARGS="$EXTRA_ARGS --disable-crc-check"
     echo -e "${YELLOW}📋 Simulation mode: CRC check will be disabled${NC}"
