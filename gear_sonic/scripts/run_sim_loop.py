@@ -4,6 +4,7 @@ Parses a YAML-based WBC config via tyro CLI, instantiates the G1 robot model,
 and launches the simulator (optionally with offscreen image publishing).
 """
 
+from functools import partial
 from typing import Dict
 
 import tyro
@@ -43,6 +44,19 @@ def main(config: ArgsConfig):
         )
         wbc_config["NUM_HAND_MOTORS"] = 6
         wbc_config["NUM_HAND_JOINTS"] = 6
+
+    if config.object_load is not None:
+        if config.hand_type != "inspire":
+            raise ValueError("--object-load currently requires --hand-type inspire")
+        from gear_sonic.utils.mujoco_sim import rh56dfx_model
+        from gear_sonic.utils.mujoco_sim.object_scene_loader import (
+            load_g1_with_rh56dfx_and_object,
+        )
+
+        rh56dfx_model.load_g1_with_rh56dfx = partial(
+            load_g1_with_rh56dfx_and_object,
+            object_load=config.object_load,
+        )
 
     if config.enable_image_publish:
         assert (

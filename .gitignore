@@ -216,6 +216,8 @@ data/
 !gear_sonic/data/robot_model/model_data/g1/scene_29dof_inspire_base.xml
 !gear_sonic/data/robot_model/model_data/g1/rh56dfx/
 !gear_sonic/data/robot_model/model_data/g1/rh56dfx/**
+!gear_sonic/data/robot_model/model_data/g1/valve_fixture/
+!gear_sonic/data/robot_model/model_data/g1/valve_fixture/**
 bones_seed_smpl/
 sonic_release/
 # Training output logs

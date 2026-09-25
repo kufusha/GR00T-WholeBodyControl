@@ -150,6 +150,9 @@ class BaseConfig(ArgsConfigTemplate):
     hand_type: Literal["dex3", "inspire"] = "dex3"
     """Hand model and DDS protocol used by the MuJoCo simulator."""
 
+    object_load: Optional[str] = None
+    """Optional object alias or `model.xml#body_name` to add to the scene."""
+
     high_elbow_pose: bool = False
     """Enable high elbow pose configuration."""
 

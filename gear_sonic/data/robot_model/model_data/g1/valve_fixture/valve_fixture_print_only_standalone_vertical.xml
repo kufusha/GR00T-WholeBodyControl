@@ -1,0 +1,35 @@
+<?xml version='1.0' encoding='utf-8'?>
+<mujoco model="g1_print_only_valve_standalone_vertical">
+  <compiler angle="radian" meshdir="." inertiafromgeom="auto" balanceinertia="true" />
+  <default>
+    <geom condim="4" friction="1.0 0.01 0.0001" solref="0.004 1" solimp="0.95 0.99 0.001" />
+  </default>
+  <asset>
+    <mesh name="valve_rotor_print_only" file="ValveRotor_PrintOnly.stl" scale="0.001 0.001 0.001" />
+    <material name="stand_gray" rgba="0.25 0.27 0.30 1" />
+    <material name="valve_blue" rgba="0.05 0.22 0.80 1" />
+  </asset>
+  <worldbody>
+    <light pos="-1 -1 2.5" dir="0.4 0.4 -1" diffuse="0.8 0.8 0.8" />
+    <geom name="floor" type="plane" size="2 2 0.1" rgba="0.78 0.80 0.82 1" friction="1.2 0.01 0.0001" />
+    <body name="stand_base" pos="0 0 0">
+      <freejoint name="stand_freejoint" />
+      <geom name="base_arm_x" type="box" size="0.37 0.05 0.0275" pos="0 0 0.0275" rgba="0.25 0.27 0.30 1" mass="4.0" />
+      <geom name="base_arm_y" type="box" size="0.05 0.37 0.0275" pos="0 0 0.0275" rgba="0.25 0.27 0.30 1" mass="4.0" />
+      <geom name="base_hub" type="box" size="0.11 0.11 0.0275" pos="0 0 0.0275" rgba="0.22 0.24 0.27 1" mass="0.8" />
+      <geom name="modular_column" type="box" size="0.06 0.06 0.42" pos="0 0 0.475" rgba="0.30 0.32 0.35 1" mass="3.0" />
+      <geom name="top_sleeve" type="box" size="0.075 0.075 0.04" pos="0 0 0.855" rgba="0.22 0.24 0.27 1" mass="0.6" />
+      <geom name="top_mount_plate" type="box" size="0.0075 0.06 0.065" pos="0.0675 0 0.95" rgba="0.22 0.24 0.27 1" mass="0.4" />
+      <body name="cartridge" pos="0.075 0 0.95">
+        <geom name="printed_mount_plate" type="box" size="0.005 0.05 0.05" pos="0.005 0 0" rgba="0.55 0.57 0.60 1" mass="0.07" />
+        <geom name="printed_axle_housing" type="cylinder" size="0.025 0.015" pos="0.024 0 0" rgba="0.55 0.57 0.60 1" mass="0.08" quat="0.70710678 0 0.70710678 0" />
+        <geom name="printed_axle" type="cylinder" size="0.0099 0.0225" pos="0.0615 0 0" rgba="0.65 0.65 0.62 1" mass="0.022" quat="0.70710678 0 0.70710678 0" />
+        <body name="valve_rotor" pos="0.0403 0 0">
+          <joint name="valve_spin_joint" type="hinge" axis="1 0 0" limited="false" damping="0.02" frictionloss="0.3" />
+          <geom name="valve_rotor_mesh" type="mesh" mesh="valve_rotor_print_only" pos="0.0337545 0 0" quat="0 0 1 0" material="valve_blue" mass="0.5" />
+        </body>
+      </body>
+    </body>
+    <camera name="overview" pos="2 -2 1.5" xyaxes="0.707 0.707 0 -0.408 0.408 0.816" />
+  </worldbody>
+</mujoco>
