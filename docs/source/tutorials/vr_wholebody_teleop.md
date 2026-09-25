@@ -256,7 +256,14 @@ Below is the **recovery procedure** — if you accidentally enter a badly calibr
 | **Toggle POSE** | **A+X** | Switches between PLANNER ↔ POSE. OR from VR_3PT (entered via PLANNER) → POSE. |
 | **Toggle PLANNER_FROZEN_UPPER** | **B+Y** | Switches between POSE ↔ PLANNER_FROZEN_UPPER. OR from VR_3PT (entered via PLANNER_FROZEN_UPPER) → POSE. |
 | **Toggle VR_3PT** | **Left Stick Click** | From any Planner mode → VR_3PT (triggers CALIB). Click again to return. |
-| **Hand grasp** | **Trigger** (per hand) | Controls the corresponding hand's grasp. |
+| **Hand grasp** | **Trigger** (per hand) | Analog control. Trigger alone is limited to 50% closure. |
+| **Full Inspire grasp** | **Grip, then Trigger** (per hand) | Grip must already be held when Trigger starts. Releasing Trigger resets the full-grasp authorization. |
+
+For Inspire hands, pressing Grip after a Trigger pull has already started does
+not increase the closure limit. Release Trigger, hold Grip, and pull Trigger
+again to intentionally enable the full `0.0` to `1.0` grasp range. The four
+fingers are interpolated with a rate limit; the thumb remains fixed during
+teleoperation.
 
 ### Joystick Controls (Planner Modes)
 
