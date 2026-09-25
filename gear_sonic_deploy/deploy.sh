@@ -213,6 +213,7 @@ show_usage() {
     echo "  --zmq-host HOST         Set the ZMQ host (default: localhost)"
     echo "  --motor-kp-scale SPEC   Scale Kp for hardware motor indices/ranges"
     echo "  --motor-kd-scale SPEC   Scale Kd for hardware motor indices/ranges"
+    echo "  --inspire-force-limit-g VALUE  RH56 force threshold per actuator in grams (1-1000; default: 100)"
     echo ""
     echo "Interface modes:"
     echo "  sim              Use loopback interface for simulation (MuJoCo)"
@@ -255,6 +256,7 @@ OUTPUT_TYPE="$OUTPUT_TYPE_DEFAULT"
 ZMQ_HOST="$ZMQ_HOST_DEFAULT"
 MOTOR_KP_SCALES=()
 MOTOR_KD_SCALES=()
+INSPIRE_FORCE_LIMIT_G="100"
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -335,6 +337,14 @@ while [[ $# -gt 0 ]]; do
             MOTOR_KD_SCALES+=("$2")
             shift 2
             ;;
+        --inspire-force-limit-g)
+            if [[ -z "$2" ]]; then
+                echo -e "${RED}Error: --inspire-force-limit-g requires a value${NC}" >&2
+                exit 1
+            fi
+            INSPIRE_FORCE_LIMIT_G="$2"
+            shift 2
+            ;;
         sim|real)
             INTERFACE_MODE="$1"
             shift
@@ -412,6 +422,7 @@ done
 for scale in "${MOTOR_KD_SCALES[@]}"; do
     EXTRA_ARGS+=("--motor-kd-scale" "$scale")
 done
+EXTRA_ARGS+=("--inspire-force-limit-g" "$INSPIRE_FORCE_LIMIT_G")
 
 # ============================================================================
 # Step 1: Check Prerequisites

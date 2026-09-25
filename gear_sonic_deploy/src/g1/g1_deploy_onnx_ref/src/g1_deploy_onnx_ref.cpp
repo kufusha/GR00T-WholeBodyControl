@@ -55,6 +55,8 @@
 #include <pthread.h>
 #include <sched.h>
 #include <array>
+#include <atomic>
+#include <csignal>
 #include <vector>
 #include <algorithm>
 #include <chrono>
@@ -67,6 +69,7 @@
 #include <chrono>
 #include <algorithm>
 #include <numeric>
+#include <thread>
 
 // DDS
 #include <unitree/robot/channel/channel_publisher.hpp>
@@ -145,6 +148,16 @@
 using namespace unitree::common;
 using namespace unitree::robot;
 using namespace unitree_hg::msg::dds_;
+
+namespace
+{
+std::atomic<bool> shutdown_signal_received{false};
+
+void requestGracefulShutdown(int)
+{
+  shutdown_signal_received.store(true, std::memory_order_relaxed);
+}
+}  // namespace
 
 
 
@@ -327,6 +340,9 @@ class G1Deploy {
     // Default 1.0 allows full closure, use --max-close-ratio to limit
     // Keyboard controls (J/K) always available for runtime adjustment
     double initial_max_close_ratio_ = 1.0;
+    // RH56 device force threshold in grams. This is consumed only by the
+    // force-safe dfx_inspire_service extension.
+    double inspire_force_limit_g_ = 100.0;
     
     // Track if vr_3point_compliance is observed by the policy
     // If false, adjusting compliance via keyboard has no effect on the policy
@@ -2164,6 +2180,7 @@ class G1Deploy {
       bool enable_motion_recording = false,
       std::array<double, 3> initial_compliance = {0.05, 0.05, 0.0},
       double initial_max_close_ratio = 1.0,
+      double inspire_force_limit_g = 100.0,
       MotorGainScaleConfig motor_gain_scales = {})
       : time_(0.0),
         publish_dt_(0.002),
@@ -2183,6 +2200,7 @@ class G1Deploy {
         enable_motion_recording_(enable_motion_recording),
         initial_vr_3point_compliance_(initial_compliance),
         initial_max_close_ratio_(initial_max_close_ratio),
+        inspire_force_limit_g_(inspire_force_limit_g),
         //env(ORT_LOGGING_LEVEL_WARNING, "G1Deploy"),
         model_path(model_file_path),
         planner_path(planner_file_path) {
@@ -2536,12 +2554,15 @@ class G1Deploy {
         // Set initial max close ratio for hands (keyboard-controlled: X/C keys)
         input_interface_->SetMaxCloseRatio(initial_max_close_ratio_);
         inspire_hands_.SetMaxCloseRatio(initial_max_close_ratio_);
+        inspire_hands_.SetForceLimitGrams(inspire_force_limit_g_);
         std::cout << "[INFO] Initial VR 3-point compliance: ["
                   << initial_vr_3point_compliance_[0] << ", "
                   << initial_vr_3point_compliance_[1] << ", "
                   << initial_vr_3point_compliance_[2] << "]" << std::endl;
         std::cout << "[INFO] Initial hand max close ratio: " << initial_max_close_ratio_ 
                   << " (1.0 = full closure allowed, 0.2 = limited)" << std::endl;
+        std::cout << "[INFO] Inspire force limit: " << inspire_force_limit_g_
+                  << " g per actuator (requires force-safe dfx service)" << std::endl;
         std::cout << "[INFO] Keyboard controls: g/h = left hand +/- 0.1, b/v = right hand +/- 0.1 (range: 0.01-0.5)" << std::endl;
         std::cout << "[INFO] Keyboard controls: x/c = hand max close ratio +/- 0.1 (range: 0.2-1.0)" << std::endl;
         
@@ -2703,6 +2724,24 @@ class G1Deploy {
     void Stop() {
       operator_state.stop = true;
 
+      // Keep the 500-Hz writer alive while both hands move to the measured
+      // protective pose. Feedback may be unavailable during simulation, so
+      // use a bounded wait and still publish the pose for the full timeout.
+      inspire_hands_.activateShutdownPose();
+      const auto hand_shutdown_deadline =
+          std::chrono::steady_clock::now() + std::chrono::milliseconds(1500);
+      bool hand_shutdown_reached = false;
+      while (std::chrono::steady_clock::now() < hand_shutdown_deadline) {
+        if (inspire_hands_.shutdownPoseReached()) {
+          hand_shutdown_reached = true;
+          break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      }
+      std::cout << "[InspireHands] Protective shutdown pose "
+                << (hand_shutdown_reached ? "reached" : "commanded (feedback timeout)")
+                << std::endl;
+
       if (control_thread_ptr_) {
         input_thread_ptr_->Wait();
         input_thread_ptr_.reset();
@@ -2740,7 +2779,8 @@ class G1Deploy {
      *        default standing angles over `duration_` seconds (linear interpolation).
      *
      * Called at 50 Hz until the ramp completes, at which point the state machine
-     * transitions to WAIT_FOR_CONTROL and the Dex3 hands open.
+     * transitions to WAIT_FOR_CONTROL. Inspire hands remain untouched until
+     * the first explicit teleoperation command.
      * @return True once LowState data is available; false if not yet ready.
      */
     bool InitControl() {
@@ -2765,12 +2805,8 @@ class G1Deploy {
           motor_command_tmp.q_target.at(i) =
               static_cast<float>(current_pos * (1.0 - ratio) + default_angles[i] * ratio);
         }
-        inspire_hands_.close(true);
-        inspire_hands_.close(false);
       } else {
         program_state_ = ProgramState::WAIT_FOR_CONTROL;
-        inspire_hands_.open(true);
-        inspire_hands_.open(false);
         std::cout << "Init Done" << std::endl;
       }
       motor_command_buffer_.SetData(motor_command_tmp);
@@ -4160,6 +4196,7 @@ int main(int argc, char const* argv[]) {
     std::cout << "  --max-close-ratio <value>: set initial hand max close ratio (0.2-1.0; default: 1.0 = full closure)" << std::endl;
     std::cout << "                             0.2 = limited (80% open), 1.0 = full closure allowed" << std::endl;
     std::cout << "                             Keyboard controls: x/c = +/- 0.1 (always available)" << std::endl;
+    std::cout << "  --inspire-force-limit-g <value>: RH56 per-actuator threshold in grams (1-1000; default: 100)" << std::endl;
     std::cout << "\nExamples:" << std::endl;
     std::cout << "  " << argv[0] << " enp5s0 policy/single_frame/model.onnx reference/bones_072925_test/ --planner-file policy/planner.onnx --obs-config policy/single_frame/observation_config.yaml --disable-crc-check" << std::endl;
     std::cout << "  " << argv[0] << " enp5s0 policy/token/model.onnx reference/bones_072925_test/ --obs-config policy/token/observation_config.yaml --encoder-file policy/token/encoder.onnx" << std::endl;
@@ -4203,6 +4240,7 @@ int main(int argc, char const* argv[]) {
   std::string zmq_out_topic = "g1_debug";
   std::array<double, 3> initial_compliance = {0.5, 0.5, 0.0}; // initial compliance is 0.5 for both hands (keyboard controllable)
   double initial_max_close_ratio = 1.0; // default allows full closure, use --max-close-ratio to limit
+  double inspire_force_limit_g = 100.0;
   MotorGainScaleConfig motor_gain_scales;
   for (int i = 4; i < argc; i++) {
     if (std::string(argv[i]) == "--disable-crc-check") {
@@ -4441,6 +4479,23 @@ int main(int argc, char const* argv[]) {
         std::cerr << "Error: --max-close-ratio requires a value argument" << std::endl;
         exit(1);
       }
+    } else if (std::string(argv[i]) == "--inspire-force-limit-g") {
+      if (i + 1 >= argc) {
+        std::cerr << "Error: --inspire-force-limit-g requires a value argument" << std::endl;
+        exit(1);
+      }
+      try {
+        inspire_force_limit_g = std::stod(argv[++i]);
+      } catch (...) {
+        std::cerr << "Error: Invalid Inspire force limit: " << argv[i] << std::endl;
+        exit(1);
+      }
+      if (inspire_force_limit_g < 1.0 || inspire_force_limit_g > 1000.0) {
+        std::cerr << "Error: --inspire-force-limit-g must be between 1 and 1000" << std::endl;
+        exit(1);
+      }
+      std::cout << "[INFO] Inspire force limit set to: "
+                << inspire_force_limit_g << " g" << std::endl;
     }
   }
 
@@ -4474,24 +4529,30 @@ int main(int argc, char const* argv[]) {
     enableMotionRecording,
     initial_compliance,
     initial_max_close_ratio,
+    inspire_force_limit_g,
     motor_gain_scales
   );
   std::cout << "[DEBUG] G1Deploy object created successfully!" << std::endl;
+
+  // SIGINT/SIGTERM only set an atomic flag. Cleanup and hand motion remain in
+  // the normal main-thread shutdown path rather than running in a signal handler.
+  std::signal(SIGINT, requestGracefulShutdown);
+  std::signal(SIGTERM, requestGracefulShutdown);
   
   // Main application loop - check both operator_state.stop and ROS2 status if using ROS2
 #if HAS_ROS2
   if (inputType == "ros2") {
-    while (!custom.operator_state.stop && rclcpp::ok()) { 
+    while (!custom.operator_state.stop && !shutdown_signal_received.load() && rclcpp::ok()) {
       sleep(0.02); 
     }
     if (!rclcpp::ok()) {
       std::cout << "[INFO] ROS2 shutdown detected (Ctrl+C)" << std::endl;
     }
   } else {
-    while (!custom.operator_state.stop) { sleep(0.02); }
+    while (!custom.operator_state.stop && !shutdown_signal_received.load()) { sleep(0.02); }
   }
 #else
-  while (!custom.operator_state.stop) { sleep(0.02); }
+  while (!custom.operator_state.stop && !shutdown_signal_received.load()) { sleep(0.02); }
 #endif
   
   std::cout << "[DEBUG] Stopping G1Deploy..." << std::endl;

@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cmath>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -46,6 +47,16 @@ public:
     static constexpr int DEX3_DOF = 7;
     static constexpr int INSPIRE_DOF = 6;
     static constexpr int TOTAL_INSPIRE_DOF = 12;
+
+    // Extended dfx_inspire_service protocol carried in fields that the
+    // upstream position-only service documents as reserved. An unmodified
+    // service continues to ignore these fields and still follows q().
+    static constexpr uint8_t SAFETY_PROTOCOL_MODE = 1;
+    static constexpr uint32_t SAFETY_PROTOCOL_MAGIC = 0x494E5350;  // "INSP"
+    static constexpr double TELEOP_CLOSING_SPEED_RAW = 500.0;
+    static constexpr double PROTECTIVE_CLOSING_SPEED_RAW = 25.0;
+    static constexpr double OPENING_SPEED_RAW = 1000.0;
+    static constexpr double DEFAULT_FORCE_LIMIT_G = 100.0;
 
     using Dex3Command = std::array<double, DEX3_DOF>;
     using InspireCommand = std::array<double, INSPIRE_DOF>;
@@ -100,9 +111,13 @@ public:
                 {
                     actual_inspire_state_[i] =
                         state->states()[i].q();
+                    actual_force_n_[i] =
+                        state->states()[i].tau_est();
                 }
 
                 has_actual_state_ = true;
+                has_force_feedback_ =
+                    state->states()[0].reserve()[0] == SAFETY_PROTOCOL_MAGIC;
             },
             1);
 
@@ -116,8 +131,14 @@ public:
         dds_command_.cmds().resize(TOTAL_INSPIRE_DOF);
         for (int i = 0; i < TOTAL_INSPIRE_DOF; ++i)
         {
+            dds_command_.cmds()[i].mode() = SAFETY_PROTOCOL_MODE;
             dds_command_.cmds()[i].q() = 1.0;
+            dds_command_.cmds()[i].dq() = PROTECTIVE_CLOSING_SPEED_RAW;
+            dds_command_.cmds()[i].tau() = DEFAULT_FORCE_LIMIT_G;
         }
+
+        shutdown_pose_active_.store(false, std::memory_order_relaxed);
+        commands_enabled_.store(false, std::memory_order_relaxed);
     }
 
     /**
@@ -136,6 +157,14 @@ public:
     double GetMaxCloseRatio() const
     {
         return max_close_ratio_.load(
+            std::memory_order_relaxed);
+    }
+
+    /** Set the RH56 hardware force threshold in grams (device raw range). */
+    void SetForceLimitGrams(double force_limit_g)
+    {
+        force_limit_g_.store(
+            std::clamp(force_limit_g, 1.0, 1000.0),
             std::memory_order_relaxed);
     }
 
@@ -158,6 +187,7 @@ public:
         {
             right_dex3_command_ = q;
         }
+        commands_enabled_.store(true, std::memory_order_release);
     }
 
     /**
@@ -205,6 +235,38 @@ public:
     }
 
     /**
+     * @brief Override normal teleoperation with the measured protective pose.
+     *
+     * Separate constants are kept for each hand so the left-hand calibration
+     * can be updated independently when measured. The current left values use
+     * the same normalized actuator targets as the measured right hand.
+     */
+    void activateShutdownPose()
+    {
+        shutdown_pose_active_.store(true, std::memory_order_release);
+        commands_enabled_.store(true, std::memory_order_release);
+    }
+
+    bool shutdownPoseReached(double tolerance = 0.03) const
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        if (!has_actual_state_)
+        {
+            return false;
+        }
+
+        for (int i = 0; i < INSPIRE_DOF; ++i)
+        {
+            if (std::abs(actual_inspire_state_[i] - RIGHT_SHUTDOWN_POSE[i]) > tolerance ||
+                std::abs(actual_inspire_state_[i + INSPIRE_DOF] - LEFT_SHUTDOWN_POSE[i]) > tolerance)
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
      * @brief Publish one Inspire hand command.
      *
      * Called from G1Deploy's command writer thread.
@@ -212,6 +274,14 @@ public:
     void writeOnce()
     {
         if (!publisher_)
+        {
+            return;
+        }
+
+        // Startup is observation-only. InitControl must not move the hands;
+        // publishing begins with the first explicit teleop command or the
+        // protective shutdown command.
+        if (!commands_enabled_.load(std::memory_order_acquire))
         {
             return;
         }
@@ -228,18 +298,31 @@ public:
         const double max_close_ratio =
             max_close_ratio_.load(
                 std::memory_order_relaxed);
+        const double force_limit_g =
+            force_limit_g_.load(std::memory_order_relaxed);
 
-        const InspireCommand left_inspire =
-            dex3ToInspire(
-                left,
-                true,
-                max_close_ratio);
+        InspireCommand left_inspire;
+        InspireCommand right_inspire;
+        const bool shutdown_pose_active =
+            shutdown_pose_active_.load(std::memory_order_acquire);
+        if (shutdown_pose_active)
+        {
+            left_inspire = LEFT_SHUTDOWN_POSE;
+            right_inspire = RIGHT_SHUTDOWN_POSE;
+        }
+        else
+        {
+            left_inspire = dex3ToInspire(left, true, max_close_ratio);
+            right_inspire = dex3ToInspire(right, false, max_close_ratio);
+        }
 
-        const InspireCommand right_inspire =
-            dex3ToInspire(
-                right,
-                false,
-                max_close_ratio);
+        std::array<double, TOTAL_INSPIRE_DOF> actual_state{};
+        bool has_actual_state = false;
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            actual_state = actual_inspire_state_;
+            has_actual_state = has_actual_state_;
+        }
 
         // dfx_inspire_service convention:
         //   0..5  = right hand
@@ -251,6 +334,26 @@ public:
 
             dds_command_.cmds()[i + INSPIRE_DOF].q() =
                 left_inspire[i];
+
+            // Inspire q decreases while closing. Normal teleoperation uses a
+            // responsive speed, while the shutdown pose remains deliberately
+            // slow to protect the fingers.
+            const double closing_speed =
+                shutdown_pose_active
+                    ? PROTECTIVE_CLOSING_SPEED_RAW
+                    : TELEOP_CLOSING_SPEED_RAW;
+            const bool right_opening =
+                has_actual_state && right_inspire[i] >= actual_state[i];
+            const bool left_opening =
+                has_actual_state &&
+                left_inspire[i] >= actual_state[i + INSPIRE_DOF];
+
+            dds_command_.cmds()[i].dq() =
+                right_opening ? OPENING_SPEED_RAW : closing_speed;
+            dds_command_.cmds()[i + INSPIRE_DOF].dq() =
+                left_opening ? OPENING_SPEED_RAW : closing_speed;
+            dds_command_.cmds()[i].tau() = force_limit_g;
+            dds_command_.cmds()[i + INSPIRE_DOF].tau() = force_limit_g;
         }
 
         publisher_->Write(dds_command_);
@@ -297,7 +400,30 @@ public:
         return {has_actual_state_, state};
     }
 
+    /** Return per-actuator force feedback in newtons from the safety service. */
+    std::pair<bool, InspireCommand>
+    getActualForce(bool is_left) const
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+
+        InspireCommand force{};
+        const int offset = is_left ? INSPIRE_DOF : 0;
+        for (int i = 0; i < INSPIRE_DOF; ++i)
+        {
+            force[i] = actual_force_n_[offset + i];
+        }
+        return {has_actual_state_ && has_force_feedback_, force};
+    }
+
 private:
+    // Measured actuator targets, normalized from the PC tool's 0..1000 units.
+    inline static constexpr InspireCommand RIGHT_SHUTDOWN_POSE = {
+        1.0, 1.0, 1.0, 1.0, 1.0, 0.0
+    };
+    inline static constexpr InspireCommand LEFT_SHUTDOWN_POSE = {
+        1.0, 1.0, 1.0, 1.0, 1.0, 0.0
+    };
+
     /**
      * @brief Convert a Dex3 joint position to [0, 1] closure ratio.
      *
@@ -493,7 +619,10 @@ private:
     mutable std::mutex state_mutex_;
     std::array<double, TOTAL_INSPIRE_DOF>
         actual_inspire_state_{};
+    std::array<double, TOTAL_INSPIRE_DOF>
+        actual_force_n_{};
     bool has_actual_state_ = false;
+    bool has_force_feedback_ = false;
 
     // DDS command reused by the 500-Hz writer thread.
     unitree_go::msg::dds_::MotorCmds_
@@ -501,6 +630,15 @@ private:
 
     std::atomic<double>
         max_close_ratio_{1.0};
+
+    std::atomic<double>
+        force_limit_g_{DEFAULT_FORCE_LIMIT_G};
+
+    std::atomic<bool>
+        shutdown_pose_active_{false};
+
+    std::atomic<bool>
+        commands_enabled_{false};
 };
 
 #endif  // INSPIRE_HANDS_HPP
