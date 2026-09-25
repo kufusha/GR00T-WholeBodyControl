@@ -258,6 +258,29 @@ Below is the **recovery procedure** — if you accidentally enter a badly calibr
 | **Toggle VR_3PT** | **Left Stick Click** | From any Planner mode → VR_3PT (triggers CALIB). Click again to return. |
 | **Hand grasp** | **Trigger** (per hand) | Controls the corresponding hand's grasp. |
 
+On a normal stop, policy OFF, `SIGINT`, or `SIGTERM`, the deploy process
+commands the configured protective hand pose before shutting down.
+
+#### RH56 force protection (real robot)
+
+The stock `dfx_inspire_service` consumes only `MotorCmd.q`; therefore it does
+not enforce the force limit sent by GEAR-SONIC. Before testing force-limited
+grasps, install the `feat/force-safe-control` branch of
+`kufusha/dfx_inspire_service` on the G1. It invokes the RH56 driver's existing
+`SetVelocity`, `SetForce`, and `GetForce` methods locally, so protection does
+not depend on a PC-to-G1 DDS round trip.
+
+Start with the default 100 g per-actuator threshold, a suspended hand, a soft
+test object, and an external force gauge:
+
+```bash
+./deploy.sh --input-type zmq_manager --inspire-force-limit-g 100 real
+```
+
+Do not copy calibration coefficients from another hand. The force response is
+finger- and device-specific. Sensor failure blocks further closure but still
+allows opening. `SIGKILL` and power loss bypass the software shutdown pose.
+
 ### Joystick Controls (Planner Modes)
 
 Active in **PLANNER**, **PLANNER_FROZEN_UPPER**, and **VR_3PT**:
