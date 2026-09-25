@@ -36,6 +36,10 @@ import torch
 import zmq
 
 from gear_sonic.utils.teleop import input_readers
+from gear_sonic.utils.teleop.inspire_hand_control import (
+    TriggerGraspController,
+    inspire_closure_to_dex3,
+)
 from gear_sonic.utils.teleop.zmq.zmq_poller import ZMQPoller
 from gear_sonic.trl.utils.rotation_conversion import decompose_rotation_aa
 from gear_sonic.trl.utils.torch_transform import (
@@ -489,28 +493,8 @@ def process_smpl_joints(body_pose, global_orient, transl):
     }
 
 
-def generate_finger_data(hand: str, trigger: float, grip: float) -> np.ndarray:
-    """
-    Generate finger position data from Pico controller button states.
-
-    Args:
-        hand: "left" or "right"
-        trigger: Trigger button value (0-1)
-        grip: Grip button value (0-1)
-
-    Returns:
-        Array of shape [25, 4, 4] representing fingertip positions
-    """
-    fingertips = np.zeros([25, 4, 4])
-
-    thumb = 0
-    middle = 10
-    # Control thumb based on shoulder button state (index 4 is thumb tip)
-    fingertips[4 + thumb, 0, 3] = 1.0  # open thumb
-    if trigger > 0.5:
-        fingertips[4 + middle, 0, 3] = 1.0  # close middle
-
-    return fingertips
+_LEFT_GRASP_CONTROLLER = TriggerGraspController()
+_RIGHT_GRASP_CONTROLLER = TriggerGraspController()
 
 
 # Joystick deadzone threshold
@@ -754,16 +738,14 @@ def get_abxy_buttons(reader=None):
 def compute_hand_joints_from_inputs(
     left_solver, right_solver, left_trigger, left_grip, right_trigger, right_grip
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Compute left/right hand joints using IK solvers, or zeros if unavailable."""
-    if left_solver is not None and right_solver is not None:
-        left_finger_data = generate_finger_data("left", left_trigger, left_grip)
-        right_finger_data = generate_finger_data("right", right_trigger, right_grip)
-        left_hand_joints = left_solver({"position": left_finger_data})
-        right_hand_joints = right_solver({"position": right_finger_data})
-    else:
-        left_hand_joints = np.zeros((1, 7), dtype=np.float32)
-        right_hand_joints = np.zeros((1, 7), dtype=np.float32)
-    return left_hand_joints, right_hand_joints
+    """Compute continuous Inspire grasp commands from PICO analog inputs."""
+    del left_solver, right_solver  # Inspire mapping does not require hand IK.
+    left_closure = _LEFT_GRASP_CONTROLLER.update(left_trigger, left_grip)
+    right_closure = _RIGHT_GRASP_CONTROLLER.update(right_trigger, right_grip)
+    return (
+        inspire_closure_to_dex3(left_closure, "left"),
+        inspire_closure_to_dex3(right_closure, "right"),
+    )
 
 
 def _quat_lerp_normalized(q0: np.ndarray, q1: np.ndarray, alpha: float) -> np.ndarray:
