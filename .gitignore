@@ -207,6 +207,15 @@ teleop_vids/
 *.code-workspace
 # Motion/training data (large local datasets, not tracked in git)
 data/
+# RH56DFX is a versioned robot model, not recorded/training data.
+!gear_sonic/data/
+!gear_sonic/data/robot_model/
+!gear_sonic/data/robot_model/model_data/
+!gear_sonic/data/robot_model/model_data/g1/
+!gear_sonic/data/robot_model/model_data/g1/g1_29dof_handless.xml
+!gear_sonic/data/robot_model/model_data/g1/scene_29dof_inspire_base.xml
+!gear_sonic/data/robot_model/model_data/g1/rh56dfx/
+!gear_sonic/data/robot_model/model_data/g1/rh56dfx/**
 bones_seed_smpl/
 sonic_release/
 # Training output logs

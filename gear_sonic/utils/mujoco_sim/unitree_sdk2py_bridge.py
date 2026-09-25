@@ -18,6 +18,11 @@ from unitree_sdk2py.idl.default import (
     unitree_hg_msg_dds__HandState_ as HandState_default,
 )
 from unitree_sdk2py.idl.unitree_go.msg.dds_ import WirelessController_
+from unitree_sdk2py.idl.unitree_go.msg.dds_ import (
+    MotorCmds_,
+    MotorState_,
+    MotorStates_,
+)
 from unitree_sdk2py.idl.unitree_hg.msg.dds_ import HandCmd_, HandState_, OdoState_
 
 
@@ -57,10 +62,14 @@ class UnitreeSdk2Bridge:
 
         self.num_body_motor = config["NUM_MOTORS"]
         self.num_hand_motor = config.get("NUM_HAND_MOTORS", 0)
+        self.hand_type = config.get("HAND_TYPE", "dex3")
         self.use_sensor = config["USE_SENSOR"]
 
         self.have_imu_ = False
         self.have_frame_sensor_ = False
+        self.low_cmd_lock = threading.Lock()
+        self.left_hand_cmd_lock = threading.Lock()
+        self.right_hand_cmd_lock = threading.Lock()
 
         # Unitree sdk2 message
         self.low_state = LowState_default()
@@ -79,26 +88,32 @@ class UnitreeSdk2Bridge:
         self.torso_imu_puber = ChannelPublisher("rt/secondary_imu", IMUState_)
         self.torso_imu_puber.Init()
 
-        self.left_hand_state = HandState_default()
-        self.left_hand_state_puber = ChannelPublisher("rt/dex3/left/state", HandState_)
-        self.left_hand_state_puber.Init()
-        self.right_hand_state = HandState_default()
-        self.right_hand_state_puber = ChannelPublisher("rt/dex3/right/state", HandState_)
-        self.right_hand_state_puber.Init()
+        if self.hand_type == "inspire":
+            self.inspire_cmd = MotorCmds_([])
+            self.inspire_state = MotorStates_([self._new_motor_state() for _ in range(12)])
+            self.inspire_state_puber = ChannelPublisher("rt/inspire/state", MotorStates_)
+            self.inspire_state_puber.Init()
+        else:
+            self.left_hand_state = HandState_default()
+            self.left_hand_state_puber = ChannelPublisher("rt/dex3/left/state", HandState_)
+            self.left_hand_state_puber.Init()
+            self.right_hand_state = HandState_default()
+            self.right_hand_state_puber = ChannelPublisher("rt/dex3/right/state", HandState_)
+            self.right_hand_state_puber.Init()
 
         self.low_cmd_suber = ChannelSubscriber("rt/lowcmd", LowCmd_)
         self.low_cmd_suber.Init(self.LowCmdHandler, 1)
 
-        self.left_hand_cmd = HandCmd_default()
-        self.left_hand_cmd_suber = ChannelSubscriber("rt/dex3/left/cmd", HandCmd_)
-        self.left_hand_cmd_suber.Init(self.LeftHandCmdHandler, 1)
-        self.right_hand_cmd = HandCmd_default()
-        self.right_hand_cmd_suber = ChannelSubscriber("rt/dex3/right/cmd", HandCmd_)
-        self.right_hand_cmd_suber.Init(self.RightHandCmdHandler, 1)
-
-        self.low_cmd_lock = threading.Lock()
-        self.left_hand_cmd_lock = threading.Lock()
-        self.right_hand_cmd_lock = threading.Lock()
+        if self.hand_type == "inspire":
+            self.inspire_cmd_suber = ChannelSubscriber("rt/inspire/cmd", MotorCmds_)
+            self.inspire_cmd_suber.Init(self.InspireCmdHandler, 1)
+        else:
+            self.left_hand_cmd = HandCmd_default()
+            self.left_hand_cmd_suber = ChannelSubscriber("rt/dex3/left/cmd", HandCmd_)
+            self.left_hand_cmd_suber.Init(self.LeftHandCmdHandler, 1)
+            self.right_hand_cmd = HandCmd_default()
+            self.right_hand_cmd_suber = ChannelSubscriber("rt/dex3/right/cmd", HandCmd_)
+            self.right_hand_cmd_suber.Init(self.RightHandCmdHandler, 1)
 
         self.wireless_controller = unitree_go_msg_dds__WirelessController_()
         self.wireless_controller_puber = ChannelPublisher(
@@ -129,6 +144,10 @@ class UnitreeSdk2Bridge:
 
         self.reset()
 
+    @staticmethod
+    def _new_motor_state() -> MotorState_:
+        return MotorState_(0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0, [0, 0])
+
     def reset(self):
         with self.low_cmd_lock:
             self.low_cmd_received = False
@@ -156,6 +175,16 @@ class UnitreeSdk2Bridge:
         with self.right_hand_cmd_lock:
             self.right_hand_cmd = msg
             self.right_hand_cmd_received = True
+            self.new_right_hand_cmd = True
+
+    def InspireCmdHandler(self, msg):
+        if len(msg.cmds) < 12:
+            return
+        with self.left_hand_cmd_lock, self.right_hand_cmd_lock:
+            self.inspire_cmd = msg
+            self.left_hand_cmd_received = True
+            self.right_hand_cmd_received = True
+            self.new_left_hand_cmd = True
             self.new_right_hand_cmd = True
 
     def cmd_received(self):
@@ -207,7 +236,19 @@ class UnitreeSdk2Bridge:
 
         self.torso_imu_puber.Write(self.torso_imu_state)
 
-        # publish hand state
+        if self.hand_type == "inspire":
+            # dfx_inspire_service channel order is right[0:6], left[6:12].
+            for i in range(self.num_hand_motor):
+                right = self.inspire_state.states[i]
+                right.q = float(obs["right_hand_command_q"][i])
+                right.dq = float(obs["right_hand_dq"][i])
+                left = self.inspire_state.states[i + self.num_hand_motor]
+                left.q = float(obs["left_hand_command_q"][i])
+                left.dq = float(obs["left_hand_dq"][i])
+            self.inspire_state_puber.Write(self.inspire_state)
+            return
+
+        # publish Dex3 hand state
         for i in range(self.num_hand_motor):
             self.left_hand_state.motor_state[i].q = obs["left_hand_q"][i]
             self.left_hand_state.motor_state[i].dq = obs["left_hand_dq"][i]
@@ -237,6 +278,16 @@ class UnitreeSdk2Bridge:
             self.cmd_received(),
             is_new_action,
         )
+
+    def GetInspireCommand(self) -> Tuple[np.ndarray, np.ndarray]:
+        """Return normalized left/right commands; Inspire uses 1=open, 0=closed."""
+        if self.hand_type != "inspire" or len(self.inspire_cmd.cmds) < 12:
+            opened = np.ones(self.num_hand_motor, dtype=np.float64)
+            return opened, opened.copy()
+        with self.left_hand_cmd_lock, self.right_hand_cmd_lock:
+            right = np.array([self.inspire_cmd.cmds[i].q for i in range(6)])
+            left = np.array([self.inspire_cmd.cmds[i + 6].q for i in range(6)])
+        return left, right
 
     def PublishWirelessController(self):
         import pygame

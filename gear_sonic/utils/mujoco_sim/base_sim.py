@@ -48,8 +48,7 @@ class DefaultEnv:
         self.num_hand_dof = self.robot.NUM_HAND_JOINTS
         self.sim_dt = self.config["SIMULATE_DT"]
         self.obs = None
-        self.torques = np.zeros(self.num_body_dof + self.num_hand_dof * 2)
-        self.torque_limit = np.array(self.robot.MOTOR_EFFORT_LIMIT_LIST)
+        self.torques = None
         self.camera_configs = camera_configs
 
         if not camera_configs and offscreen and enable_image_publish:
@@ -62,6 +61,7 @@ class DefaultEnv:
         self.onscreen = onscreen
 
         self.init_scene()
+        self.torques = np.zeros(self.mj_model.nu)
         self.last_reward = 0
 
         self.offscreen = offscreen
@@ -147,14 +147,27 @@ class DefaultEnv:
     def init_scene(self):
         """Initialize the default robot scene"""
         xml_path = str(pathlib.Path(GEAR_SONIC_ROOT) / self.config["ROBOT_SCENE"])
-        self.mj_model = mujoco.MjModel.from_xml_path(xml_path)
+        if self.config.get("HAND_TYPE", "dex3") == "inspire":
+            from gear_sonic.utils.mujoco_sim.rh56dfx_model import load_g1_with_rh56dfx
+
+            model_dir = Path(xml_path).parent
+            self.mj_model = load_g1_with_rh56dfx(model_dir)
+        else:
+            self.mj_model = mujoco.MjModel.from_xml_path(xml_path)
         self.mj_data = mujoco.MjData(self.mj_model)
         self.mj_model.opt.timestep = self.sim_dt
         self.torso_index = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, "torso_link")
         self.root_body = "pelvis"
         self.root_body_id = self.mj_model.body(self.root_body).id
 
-        self.joint_class_map = self._get_dof_indices_by_class()
+        # mj_saveLastXML only works for models loaded through MuJoCo's XML
+        # loader.  The Inspire model is assembled in memory with MjSpec, and
+        # this class metadata is not used by the teleoperation path.
+        self.joint_class_map = (
+            {}
+            if self.config.get("HAND_TYPE", "dex3") == "inspire"
+            else self._get_dof_indices_by_class()
+        )
 
         self.perform_sysid_search = self.config.get("perform_sysid_search", False)
 
@@ -239,6 +252,22 @@ class DefaultEnv:
             elif "right_hand" in name:
                 self.right_hand_index.append(i)
 
+        if self.config.get("HAND_TYPE", "dex3") == "inspire":
+            active_suffixes = (
+                "pinky_proximal_joint",
+                "ring_proximal_joint",
+                "middle_proximal_joint",
+                "index_proximal_joint",
+                "thumb_proximal_pitch_joint",
+                "thumb_proximal_yaw_joint",
+            )
+            self.left_hand_index = [
+                self.mj_model.joint(f"left_hand_{suffix}").id for suffix in active_suffixes
+            ]
+            self.right_hand_index = [
+                self.mj_model.joint(f"right_hand_{suffix}").id for suffix in active_suffixes
+            ]
+
         assert len(self.body_joint_index) == self.robot.NUM_JOINTS
         assert len(self.left_hand_index) == self.robot.NUM_HAND_JOINTS
         assert len(self.right_hand_index) == self.robot.NUM_HAND_JOINTS
@@ -246,6 +275,27 @@ class DefaultEnv:
         self.body_joint_index = np.array(self.body_joint_index)
         self.left_hand_index = np.array(self.left_hand_index)
         self.right_hand_index = np.array(self.right_hand_index)
+        self.body_qpos_index = self.mj_model.jnt_qposadr[self.body_joint_index]
+        self.body_qvel_index = self.mj_model.jnt_dofadr[self.body_joint_index]
+        self.left_hand_qpos_index = self.mj_model.jnt_qposadr[self.left_hand_index]
+        self.left_hand_qvel_index = self.mj_model.jnt_dofadr[self.left_hand_index]
+        self.right_hand_qpos_index = self.mj_model.jnt_qposadr[self.right_hand_index]
+        self.right_hand_qvel_index = self.mj_model.jnt_dofadr[self.right_hand_index]
+
+        joint_to_actuator = {
+            int(joint_id): actuator_id
+            for actuator_id, joint_id in enumerate(self.mj_model.actuator_trnid[:, 0])
+            if joint_id >= 0
+        }
+        self.body_actuator_index = np.array(
+            [joint_to_actuator[int(joint_id)] for joint_id in self.body_joint_index]
+        )
+        self.left_hand_actuator_index = np.array(
+            [joint_to_actuator[int(joint_id)] for joint_id in self.left_hand_index]
+        )
+        self.right_hand_actuator_index = np.array(
+            [joint_to_actuator[int(joint_id)] for joint_id in self.right_hand_index]
+        )
 
     def init_renderers(self):
         self.renderers = {}
@@ -277,12 +327,12 @@ class DefaultEnv:
                         + self.unitree_bridge.low_cmd.motor_cmd[i].kp
                         * (
                             self.unitree_bridge.low_cmd.motor_cmd[i].q
-                            - self.mj_data.qpos[self.body_joint_index[i] + self.qpos_offset - 1]
+                            - self.mj_data.qpos[self.body_qpos_index[i]]
                         )
                         + self.unitree_bridge.low_cmd.motor_cmd[i].kd
                         * (
                             self.unitree_bridge.low_cmd.motor_cmd[i].dq
-                            - self.mj_data.qvel[self.body_joint_index[i] + self.qvel_offset - 1]
+                            - self.mj_data.qvel[self.body_qvel_index[i]]
                         )
                     )
         return body_torques
@@ -300,6 +350,8 @@ class DefaultEnv:
     def compute_hand_torques(self) -> np.ndarray:
         left_hand_torques = np.zeros(self.num_hand_dof)
         right_hand_torques = np.zeros(self.num_hand_dof)
+        if self.config.get("HAND_TYPE", "dex3") == "inspire":
+            return np.concatenate((left_hand_torques, right_hand_torques))
         if self.unitree_bridge is not None and self.unitree_bridge.low_cmd:
             for i in range(self.unitree_bridge.num_hand_motor):
                 left_hand_torques[i] = (
@@ -307,12 +359,12 @@ class DefaultEnv:
                     + self.unitree_bridge.left_hand_cmd.motor_cmd[i].kp
                     * (
                         self.unitree_bridge.left_hand_cmd.motor_cmd[i].q
-                        - self.mj_data.qpos[self.left_hand_index[i] + self.qpos_offset - 1]
+                        - self.mj_data.qpos[self.left_hand_qpos_index[i]]
                     )
                     + self.unitree_bridge.left_hand_cmd.motor_cmd[i].kd
                     * (
                         self.unitree_bridge.left_hand_cmd.motor_cmd[i].dq
-                        - self.mj_data.qvel[self.left_hand_index[i] + self.qvel_offset - 1]
+                        - self.mj_data.qvel[self.left_hand_qvel_index[i]]
                     )
                 )
                 right_hand_torques[i] = (
@@ -320,12 +372,12 @@ class DefaultEnv:
                     + self.unitree_bridge.right_hand_cmd.motor_cmd[i].kp
                     * (
                         self.unitree_bridge.right_hand_cmd.motor_cmd[i].q
-                        - self.mj_data.qpos[self.right_hand_index[i] + self.qpos_offset - 1]
+                        - self.mj_data.qpos[self.right_hand_qpos_index[i]]
                     )
                     + self.unitree_bridge.right_hand_cmd.motor_cmd[i].kd
                     * (
                         self.unitree_bridge.right_hand_cmd.motor_cmd[i].dq
-                        - self.mj_data.qvel[self.right_hand_index[i] + self.qvel_offset - 1]
+                        - self.mj_data.qvel[self.right_hand_qvel_index[i]]
                     )
                 )
         return np.concatenate((left_hand_torques, right_hand_torques))
@@ -370,19 +422,26 @@ class DefaultEnv:
         )
         obs["secondary_imu_vel"] = pose[7:13]
 
-        obs["body_q"] = self.mj_data.qpos[self.body_joint_index + 7 - 1]
-        obs["body_dq"] = self.mj_data.qvel[self.body_joint_index + 6 - 1]
-        obs["body_ddq"] = self.mj_data.qacc[self.body_joint_index + 6 - 1]
-        obs["body_tau_est"] = self.mj_data.actuator_force[self.body_joint_index - 1]
+        obs["body_q"] = self.mj_data.qpos[self.body_qpos_index]
+        obs["body_dq"] = self.mj_data.qvel[self.body_qvel_index]
+        obs["body_ddq"] = self.mj_data.qacc[self.body_qvel_index]
+        obs["body_tau_est"] = self.mj_data.actuator_force[self.body_actuator_index]
         if self.num_hand_dof > 0:
-            obs["left_hand_q"] = self.mj_data.qpos[self.left_hand_index + self.qpos_offset - 1]
-            obs["left_hand_dq"] = self.mj_data.qvel[self.left_hand_index + self.qvel_offset - 1]
-            obs["left_hand_ddq"] = self.mj_data.qacc[self.left_hand_index + self.qvel_offset - 1]
-            obs["left_hand_tau_est"] = self.mj_data.actuator_force[self.left_hand_index - 1]
-            obs["right_hand_q"] = self.mj_data.qpos[self.right_hand_index + self.qpos_offset - 1]
-            obs["right_hand_dq"] = self.mj_data.qvel[self.right_hand_index + self.qvel_offset - 1]
-            obs["right_hand_ddq"] = self.mj_data.qacc[self.right_hand_index + self.qvel_offset - 1]
-            obs["right_hand_tau_est"] = self.mj_data.actuator_force[self.right_hand_index - 1]
+            obs["left_hand_q"] = self.mj_data.qpos[self.left_hand_qpos_index]
+            obs["left_hand_dq"] = self.mj_data.qvel[self.left_hand_qvel_index]
+            obs["left_hand_ddq"] = self.mj_data.qacc[self.left_hand_qvel_index]
+            obs["left_hand_tau_est"] = self.mj_data.actuator_force[self.left_hand_actuator_index]
+            obs["right_hand_q"] = self.mj_data.qpos[self.right_hand_qpos_index]
+            obs["right_hand_dq"] = self.mj_data.qvel[self.right_hand_qvel_index]
+            obs["right_hand_ddq"] = self.mj_data.qacc[self.right_hand_qvel_index]
+            obs["right_hand_tau_est"] = self.mj_data.actuator_force[self.right_hand_actuator_index]
+            if self.config.get("HAND_TYPE", "dex3") == "inspire":
+                obs["left_hand_command_q"] = self._inspire_joint_to_command(
+                    obs["left_hand_q"], self.left_hand_actuator_index
+                )
+                obs["right_hand_command_q"] = self._inspire_joint_to_command(
+                    obs["right_hand_q"], self.right_hand_actuator_index
+                )
         obs["time"] = self.mj_data.time
         return obs
 
@@ -415,12 +474,27 @@ class DefaultEnv:
         body_torques = self.compute_body_torques()
         hand_torques = self.compute_hand_torques()
         # -1: actuator array is 0-based while joint indices from the model are 1-based
-        self.torques[self.body_joint_index - 1] = body_torques
+        self.torques.fill(0.0)
+        self.torques[self.body_actuator_index] = body_torques
         if self.num_hand_dof > 0:
-            self.torques[self.left_hand_index - 1] = hand_torques[: self.num_hand_dof]
-            self.torques[self.right_hand_index - 1] = hand_torques[self.num_hand_dof :]
+            if self.config.get("HAND_TYPE", "dex3") == "inspire":
+                left_cmd, right_cmd = self.unitree_bridge.GetInspireCommand()
+                self.torques[self.left_hand_actuator_index] = self._inspire_command_to_ctrl(
+                    left_cmd, self.left_hand_actuator_index
+                )
+                self.torques[self.right_hand_actuator_index] = self._inspire_command_to_ctrl(
+                    right_cmd, self.right_hand_actuator_index
+                )
+            else:
+                self.torques[self.left_hand_actuator_index] = hand_torques[: self.num_hand_dof]
+                self.torques[self.right_hand_actuator_index] = hand_torques[self.num_hand_dof :]
 
-        self.torques = np.clip(self.torques, -self.torque_limit, self.torque_limit)
+        limited = self.mj_model.actuator_ctrllimited.astype(bool)
+        self.torques[limited] = np.clip(
+            self.torques[limited],
+            self.mj_model.actuator_ctrlrange[limited, 0],
+            self.mj_model.actuator_ctrlrange[limited, 1],
+        )
 
         if self.config["FREE_BASE"]:
             # Prepend 6 zeros for the floating-base root DOF actuators
@@ -430,6 +504,16 @@ class DefaultEnv:
         mujoco.mj_step(self.mj_model, self.mj_data)
 
         self.check_fall()
+
+    def _inspire_command_to_ctrl(self, command, actuator_indices):
+        command = np.clip(np.asarray(command, dtype=np.float64), 0.0, 1.0)
+        ranges = self.mj_model.actuator_ctrlrange[actuator_indices]
+        return ranges[:, 0] + (1.0 - command) * (ranges[:, 1] - ranges[:, 0])
+
+    def _inspire_joint_to_command(self, positions, actuator_indices):
+        ranges = self.mj_model.actuator_ctrlrange[actuator_indices]
+        span = ranges[:, 1] - ranges[:, 0]
+        return np.clip(1.0 - (positions - ranges[:, 0]) / span, 0.0, 1.0)
 
     def apply_perturbation(self, key):
         perturbation_x_body = 0.0
@@ -547,6 +631,7 @@ class BaseSimulator:
         self.image_dt = self.config.get("IMAGE_DT", 0.033333)
         self.viewer_dt = self.config.get("VIEWER_DT", 0.02)
         self._running = True
+        self.sim_env = None
 
         self.robot = Robot(self.config)
 
@@ -640,15 +725,19 @@ class BaseSimulator:
         self.close()
 
     def reset(self):
-        self.sim_env.reset()
+        if self.sim_env is not None:
+            self.sim_env.reset()
 
     def close(self):
         self._running = False
+        sim_env = getattr(self, "sim_env", None)
+        if sim_env is None:
+            return
         try:
-            if self.sim_env.image_publish_process is not None:
-                self.sim_env.image_publish_process.stop()
-            if self.sim_env.viewer is not None:
-                self.sim_env.viewer.close()
+            if sim_env.image_publish_process is not None:
+                sim_env.image_publish_process.stop()
+            if sim_env.viewer is not None:
+                sim_env.viewer.close()
         except Exception as e:
             print(f"Warning during close: {e}")
 

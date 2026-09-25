@@ -37,6 +37,12 @@ def main(config: ArgsConfig):
     wbc_config = config.load_wbc_yaml()
     # NOTE: we will override the interface to local if it is not specified
     wbc_config["ENV_NAME"] = config.env_name
+    if config.hand_type == "inspire":
+        wbc_config["ROBOT_SCENE"] = (
+            "gear_sonic/data/robot_model/model_data/g1/scene_29dof_inspire_base.xml"
+        )
+        wbc_config["NUM_HAND_MOTORS"] = 6
+        wbc_config["NUM_HAND_JOINTS"] = 6
 
     if config.enable_image_publish:
         assert (
