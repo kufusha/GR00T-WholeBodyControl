@@ -37,7 +37,7 @@ import zmq
 
 from gear_sonic.utils.teleop import input_readers
 from gear_sonic.utils.teleop.inspire_hand_control import (
-    TriggerGraspController,
+    BimanualGraspController,
     inspire_closure_to_dex3,
 )
 from gear_sonic.utils.teleop.zmq.zmq_poller import ZMQPoller
@@ -493,8 +493,7 @@ def process_smpl_joints(body_pose, global_orient, transl):
     }
 
 
-_LEFT_GRASP_CONTROLLER = TriggerGraspController()
-_RIGHT_GRASP_CONTROLLER = TriggerGraspController()
+_GRASP_CONTROLLERS = BimanualGraspController()
 
 
 # Joystick deadzone threshold
@@ -740,8 +739,9 @@ def compute_hand_joints_from_inputs(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Compute continuous Inspire grasp commands from PICO analog inputs."""
     del left_solver, right_solver  # Inspire mapping does not require hand IK.
-    left_closure = _LEFT_GRASP_CONTROLLER.update(left_trigger, left_grip)
-    right_closure = _RIGHT_GRASP_CONTROLLER.update(right_trigger, right_grip)
+    left_closure, right_closure = _GRASP_CONTROLLERS.update(
+        left_trigger, left_grip, right_trigger, right_grip
+    )
     return (
         inspire_closure_to_dex3(left_closure, "left"),
         inspire_closure_to_dex3(right_closure, "right"),
@@ -2051,6 +2051,7 @@ def run_pico_manager(
 
             # Handle mode transitions before running loop
             if new_mode != current_mode:
+                _GRASP_CONTROLLERS.on_mode_transition()
                 if current_mode == StreamMode.POSE:
                     pose_streamer.on_mode_exit()
 

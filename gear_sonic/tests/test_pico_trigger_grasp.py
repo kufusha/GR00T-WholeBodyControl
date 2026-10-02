@@ -1,6 +1,7 @@
 import numpy as np
 
 from gear_sonic.utils.teleop.inspire_hand_control import (
+    BimanualGraspController,
     TriggerGraspController,
     inspire_closure_to_dex3,
 )
@@ -30,6 +31,42 @@ def test_grip_pressed_mid_trigger_does_not_upgrade_latched_mode():
 
     assert _update(controller, 0.0, 1.0) == 0.0
     assert _update(controller, 1.0, 1.0) == 1.0
+
+
+def test_mode_transition_requires_release_before_rearming_both_hands():
+    left = TriggerGraspController(max_closure_rate=100.0)
+    right = TriggerGraspController(max_closure_rate=100.0)
+    controllers = BimanualGraspController(left, right)
+
+    left.last_update_time -= 1.0
+    right.last_update_time -= 1.0
+    left_closure, right_closure = controllers.update(1.0, 1.0, 1.0, 1.0)
+    assert left_closure == 1.0
+    assert right_closure == 1.0
+
+    controllers.on_mode_transition()
+    left_closure, right_closure = controllers.update(1.0, 0.0, 1.0, 0.0)
+    assert left_closure == 0.0
+    assert right_closure == 0.0
+
+    controllers.update(0.0, 0.0, 0.0, 0.0)
+    left.last_update_time -= 1.0
+    right.last_update_time -= 1.0
+    left_closure, right_closure = controllers.update(1.0, 0.0, 1.0, 0.0)
+    assert left_closure == 0.5
+    assert right_closure == 0.5
+
+
+def test_non_finite_trigger_does_not_clear_mode_transition_interlock():
+    for trigger in (np.nan, np.inf, -np.inf):
+        controller = TriggerGraspController(max_closure_rate=100.0)
+        controller.reset_for_mode_transition()
+
+        assert _update(controller, trigger, 1.0) == 0.0
+        assert _update(controller, 1.0, 1.0) == 0.0
+
+        assert _update(controller, 0.0, 0.0) == 0.0
+        assert _update(controller, 1.0, 1.0) == 1.0
 
 
 def test_output_rate_is_limited():
