@@ -265,6 +265,10 @@ again to intentionally enable the full `0.0` to `1.0` grasp range. The four
 fingers are interpolated with a rate limit; the thumb remains fixed during
 teleoperation.
 
+Changing teleoperation modes opens both Inspire hands and disarms grasp input.
+Each Trigger must return to its released position before that hand can be
+rearmed; release and pull Trigger again after every mode change.
+
 ### Joystick Controls (Planner Modes)
 
 Active in **PLANNER**, **PLANNER_FROZEN_UPPER**, and **VR_3PT**:

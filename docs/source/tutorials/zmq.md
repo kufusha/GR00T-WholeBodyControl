@@ -156,6 +156,10 @@ In `--input-type zmq` mode, the C++ deployment side does **not** process PICO co
 | **Grip, then Trigger** | Enables the full Inspire grasp range for that Trigger press. Pressing Grip midway does not increase the limit. |
 | **B + Y** | Toggle Pose mode in the streamer (same effect as A+X) — starts or stops publishing pose data. **Works as pause/resume.** |
 
+Whenever the Python streamer changes teleoperation modes, it opens both Inspire
+hands and disarms their grasp inputs. Release each Trigger fully, then pull it
+again to rearm that hand after a mode change.
+
 All mode control on the deployment side is done from the keyboard:
 
 | Key | Action |
