@@ -94,6 +94,25 @@ class ValveFixtureModelTests(unittest.TestCase):
         mujoco.mj_forward(model, data)
         self.assertAlmostEqual(data.body("object_valve_rotor").xpos[2], 0.95, places=4)
 
+    def test_object_selection_does_not_leak_into_the_next_scene(self):
+        with_object = self.loader.load_inspire_scene(
+            MODEL_DIR, object_load="valve-horizontal"
+        )
+        without_object = self.loader.load_inspire_scene(MODEL_DIR, object_load=None)
+
+        self.assertNotEqual(
+            mujoco.mj_name2id(
+                with_object, mujoco.mjtObj.mjOBJ_JOINT, "object_valve_spin_joint"
+            ),
+            -1,
+        )
+        self.assertEqual(
+            mujoco.mj_name2id(
+                without_object, mujoco.mjtObj.mjOBJ_JOINT, "object_valve_spin_joint"
+            ),
+            -1,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -78,7 +78,13 @@ module = "tests.*"
 strict_optional = false
 
 [tool.pytest.ini_options]
-testpaths = "decoupled_wbc/tests/"
+testpaths = [
+  "decoupled_wbc/tests/",
+  "gear_sonic/tests/test_pico_trigger_grasp.py",
+  "gear_sonic/tests/test_inspire_sim_mapping.py",
+  "gear_sonic/tests/test_rh56dfx_model.py",
+  "gear_sonic/tests/test_valve_fixture_model.py",
+]
 python_classes = [
   "Test*",
   "*Test"

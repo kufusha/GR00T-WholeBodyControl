@@ -22,6 +22,11 @@ from scipy.spatial.transform import Rotation
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize
 
 from gear_sonic.utils.mujoco_sim.metric_utils import check_contact, check_height
+from gear_sonic.utils.mujoco_sim.inspire_sim_mapping import (
+    actuator_indices_for_joints,
+    control_array_to_normalized,
+    normalized_array_to_control,
+)
 from gear_sonic.utils.mujoco_sim.sim_utils import get_subtree_body_names
 from gear_sonic.utils.mujoco_sim.unitree_sdk2py_bridge import ElasticBand, UnitreeSdk2Bridge
 from gear_sonic.utils.mujoco_sim.robot import Robot
@@ -148,10 +153,12 @@ class DefaultEnv:
         """Initialize the default robot scene"""
         xml_path = str(pathlib.Path(GEAR_SONIC_ROOT) / self.config["ROBOT_SCENE"])
         if self.config.get("HAND_TYPE", "dex3") == "inspire":
-            from gear_sonic.utils.mujoco_sim.rh56dfx_model import load_g1_with_rh56dfx
+            from gear_sonic.utils.mujoco_sim.object_scene_loader import load_inspire_scene
 
             model_dir = Path(xml_path).parent
-            self.mj_model = load_g1_with_rh56dfx(model_dir)
+            self.mj_model = load_inspire_scene(
+                model_dir, object_load=self.config.get("OBJECT_LOAD")
+            )
         else:
             self.mj_model = mujoco.MjModel.from_xml_path(xml_path)
         self.mj_data = mujoco.MjData(self.mj_model)
@@ -282,19 +289,14 @@ class DefaultEnv:
         self.right_hand_qpos_index = self.mj_model.jnt_qposadr[self.right_hand_index]
         self.right_hand_qvel_index = self.mj_model.jnt_dofadr[self.right_hand_index]
 
-        joint_to_actuator = {
-            int(joint_id): actuator_id
-            for actuator_id, joint_id in enumerate(self.mj_model.actuator_trnid[:, 0])
-            if joint_id >= 0
-        }
-        self.body_actuator_index = np.array(
-            [joint_to_actuator[int(joint_id)] for joint_id in self.body_joint_index]
+        self.body_actuator_index = actuator_indices_for_joints(
+            self.mj_model, self.body_joint_index
         )
-        self.left_hand_actuator_index = np.array(
-            [joint_to_actuator[int(joint_id)] for joint_id in self.left_hand_index]
+        self.left_hand_actuator_index = actuator_indices_for_joints(
+            self.mj_model, self.left_hand_index
         )
-        self.right_hand_actuator_index = np.array(
-            [joint_to_actuator[int(joint_id)] for joint_id in self.right_hand_index]
+        self.right_hand_actuator_index = actuator_indices_for_joints(
+            self.mj_model, self.right_hand_index
         )
 
     def init_renderers(self):
@@ -506,14 +508,12 @@ class DefaultEnv:
         self.check_fall()
 
     def _inspire_command_to_ctrl(self, command, actuator_indices):
-        command = np.clip(np.asarray(command, dtype=np.float64), 0.0, 1.0)
         ranges = self.mj_model.actuator_ctrlrange[actuator_indices]
-        return ranges[:, 0] + (1.0 - command) * (ranges[:, 1] - ranges[:, 0])
+        return normalized_array_to_control(command, ranges)
 
     def _inspire_joint_to_command(self, positions, actuator_indices):
         ranges = self.mj_model.actuator_ctrlrange[actuator_indices]
-        span = ranges[:, 1] - ranges[:, 0]
-        return np.clip(1.0 - (positions - ranges[:, 0]) / span, 0.0, 1.0)
+        return control_array_to_normalized(positions, ranges)
 
     def apply_perturbation(self, key):
         perturbation_x_body = 0.0

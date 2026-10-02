@@ -3,6 +3,12 @@ from pathlib import Path
 import unittest
 
 import mujoco
+import numpy as np
+
+from gear_sonic.utils.mujoco_sim.inspire_sim_mapping import (
+    control_array_to_normalized,
+    normalized_array_to_control,
+)
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -57,6 +63,27 @@ class Rh56dfxModelTests(unittest.TestCase):
         self.assertEqual(closed_control, upper)
         self.assertEqual(module.control_to_normalized(lower, lower, upper), 1.0)
         self.assertEqual(module.control_to_normalized(upper, lower, upper), 0.0)
+
+    def test_all_twelve_hand_actuators_round_trip_open_and_closed(self):
+        spec = importlib.util.spec_from_file_location("rh56dfx_model", LOADER_PATH)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        model = module.load_g1_with_rh56dfx(MODEL_DIR)
+        hand_actuator_ids = [
+            actuator_id
+            for actuator_id in range(model.nu)
+            if "hand" in model.actuator(actuator_id).name
+        ]
+        self.assertEqual(len(hand_actuator_ids), 12)
+        ranges = model.actuator_ctrlrange[hand_actuator_ids]
+
+        open_controls = normalized_array_to_control(np.ones(12), ranges)
+        closed_controls = normalized_array_to_control(np.zeros(12), ranges)
+
+        np.testing.assert_allclose(open_controls, ranges[:, 0])
+        np.testing.assert_allclose(closed_controls, ranges[:, 1])
+        np.testing.assert_allclose(control_array_to_normalized(open_controls, ranges), 1.0)
+        np.testing.assert_allclose(control_array_to_normalized(closed_controls, ranges), 0.0)
 
 
 if __name__ == "__main__":

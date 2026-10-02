@@ -128,3 +128,16 @@ def load_g1_with_rh56dfx_and_object(
         fixture_body_name=body_name if separator and body_name else "stand_base",
         fixture_prefix="object_",
     )
+
+
+def load_inspire_scene(
+    model_dir: Path,
+    object_load: str | None = None,
+) -> mujoco.MjModel:
+    """Load a fresh Inspire scene with an optional registered object."""
+    if object_load is not None:
+        return load_g1_with_rh56dfx_and_object(model_dir, object_load)
+
+    from gear_sonic.utils.mujoco_sim.rh56dfx_model import load_g1_with_rh56dfx
+
+    return load_g1_with_rh56dfx(model_dir)

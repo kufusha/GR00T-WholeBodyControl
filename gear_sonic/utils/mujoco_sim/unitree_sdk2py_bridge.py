@@ -25,6 +25,12 @@ from unitree_sdk2py.idl.unitree_go.msg.dds_ import (
 )
 from unitree_sdk2py.idl.unitree_hg.msg.dds_ import HandCmd_, HandState_, OdoState_
 
+from gear_sonic.utils.mujoco_sim.inspire_sim_mapping import (
+    pack_inspire_state_positions,
+    pack_inspire_state_velocities,
+    split_inspire_command_positions,
+)
+
 
 class UnitreeSdk2Bridge:
     """
@@ -238,13 +244,17 @@ class UnitreeSdk2Bridge:
 
         if self.hand_type == "inspire":
             # dfx_inspire_service channel order is right[0:6], left[6:12].
-            for i in range(self.num_hand_motor):
-                right = self.inspire_state.states[i]
-                right.q = float(obs["right_hand_command_q"][i])
-                right.dq = float(obs["right_hand_dq"][i])
-                left = self.inspire_state.states[i + self.num_hand_motor]
-                left.q = float(obs["left_hand_command_q"][i])
-                left.dq = float(obs["left_hand_dq"][i])
+            positions = pack_inspire_state_positions(
+                obs["left_hand_command_q"], obs["right_hand_command_q"]
+            )
+            velocities = pack_inspire_state_velocities(
+                obs["left_hand_dq"], obs["right_hand_dq"]
+            )
+            for state, position, velocity in zip(
+                self.inspire_state.states, positions, velocities
+            ):
+                state.q = float(position)
+                state.dq = float(velocity)
             self.inspire_state_puber.Write(self.inspire_state)
             return
 
@@ -281,13 +291,12 @@ class UnitreeSdk2Bridge:
 
     def GetInspireCommand(self) -> Tuple[np.ndarray, np.ndarray]:
         """Return normalized left/right commands; Inspire uses 1=open, 0=closed."""
-        if self.hand_type != "inspire" or len(self.inspire_cmd.cmds) < 12:
+        if self.hand_type != "inspire":
             opened = np.ones(self.num_hand_motor, dtype=np.float64)
             return opened, opened.copy()
         with self.left_hand_cmd_lock, self.right_hand_cmd_lock:
-            right = np.array([self.inspire_cmd.cmds[i].q for i in range(6)])
-            left = np.array([self.inspire_cmd.cmds[i + 6].q for i in range(6)])
-        return left, right
+            positions = [command.q for command in self.inspire_cmd.cmds]
+        return split_inspire_command_positions(positions, self.num_hand_motor)
 
     def PublishWirelessController(self):
         import pygame
