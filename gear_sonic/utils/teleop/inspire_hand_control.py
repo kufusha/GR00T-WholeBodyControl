@@ -113,6 +113,18 @@ class BimanualGraspController:
         self.right.reset_for_mode_transition()
 
 
+def sync_grasp_mode_transition(
+    controllers: BimanualGraspController,
+    current_mode: object,
+    new_mode: object,
+) -> bool:
+    """Reset grasp state when the streaming mode changes."""
+    if new_mode == current_mode:
+        return False
+    controllers.on_mode_transition()
+    return True
+
+
 def inspire_closure_to_dex3(closure: float, hand: str) -> np.ndarray:
     """Build a Dex3-compatible command for the Inspire adapter.
 

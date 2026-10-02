@@ -4,6 +4,7 @@ from gear_sonic.utils.teleop.inspire_hand_control import (
     BimanualGraspController,
     TriggerGraspController,
     inspire_closure_to_dex3,
+    sync_grasp_mode_transition,
 )
 
 
@@ -55,6 +56,62 @@ def test_mode_transition_requires_release_before_rearming_both_hands():
     left_closure, right_closure = controllers.update(1.0, 0.0, 1.0, 0.0)
     assert left_closure == 0.5
     assert right_closure == 0.5
+
+
+def test_grasp_mode_sync_resets_only_when_mode_changes():
+    left = TriggerGraspController(max_closure_rate=100.0)
+    right = TriggerGraspController(max_closure_rate=100.0)
+    controllers = BimanualGraspController(left, right)
+
+    left.last_update_time -= 1.0
+    right.last_update_time -= 1.0
+    controllers.update(1.0, 1.0, 1.0, 1.0)
+
+    assert not sync_grasp_mode_transition(controllers, "pose", "pose")
+    assert controllers.update(1.0, 0.0, 1.0, 0.0) == (1.0, 1.0)
+
+    assert sync_grasp_mode_transition(controllers, "pose", "planner")
+    assert controllers.update(1.0, 0.0, 1.0, 0.0) == (0.0, 0.0)
+
+
+def test_each_hand_rearms_independently_after_mode_transition():
+    left = TriggerGraspController(max_closure_rate=100.0)
+    right = TriggerGraspController(max_closure_rate=100.0)
+    controllers = BimanualGraspController(left, right)
+    controllers.on_mode_transition()
+
+    controllers.update(0.0, 0.0, 1.0, 0.0)
+    left.last_update_time -= 1.0
+    right.last_update_time -= 1.0
+    assert controllers.update(1.0, 0.0, 1.0, 0.0) == (0.5, 0.0)
+
+    controllers.update(0.0, 0.0, 0.0, 0.0)
+    left.last_update_time -= 1.0
+    right.last_update_time -= 1.0
+    assert controllers.update(1.0, 0.0, 1.0, 0.0) == (0.5, 0.5)
+
+
+def test_repeated_mode_transition_requires_another_release():
+    controller = TriggerGraspController(max_closure_rate=100.0)
+    controllers = BimanualGraspController(controller, TriggerGraspController())
+
+    controllers.on_mode_transition()
+    _update(controller, 0.0, 0.0)
+    assert _update(controller, 1.0, 1.0) == 1.0
+
+    controllers.on_mode_transition()
+    assert _update(controller, 1.0, 1.0) == 0.0
+    assert _update(controller, 0.0, 1.0) == 0.0
+    assert _update(controller, 1.0, 1.0) == 1.0
+
+
+def test_release_and_press_thresholds_are_inclusive():
+    controller = TriggerGraspController(max_closure_rate=100.0)
+    controller.reset_for_mode_transition()
+
+    assert _update(controller, controller.release_threshold + 1e-6, 1.0) == 0.0
+    assert _update(controller, controller.release_threshold, 1.0) == 0.0
+    assert _update(controller, controller.press_threshold, controller.grip_threshold) == 0.05
 
 
 def test_non_finite_trigger_does_not_clear_mode_transition_interlock():

@@ -39,6 +39,7 @@ from gear_sonic.utils.teleop import input_readers
 from gear_sonic.utils.teleop.inspire_hand_control import (
     BimanualGraspController,
     inspire_closure_to_dex3,
+    sync_grasp_mode_transition,
 )
 from gear_sonic.utils.teleop.zmq.zmq_poller import ZMQPoller
 from gear_sonic.trl.utils.rotation_conversion import decompose_rotation_aa
@@ -2049,9 +2050,12 @@ def run_pico_manager(
                 elif by_pressed and not prev_by_pressed:
                     new_mode = StreamMode.POSE
 
+            mode_changed = sync_grasp_mode_transition(
+                _GRASP_CONTROLLERS, current_mode, new_mode
+            )
+
             # Handle mode transitions before running loop
-            if new_mode != current_mode:
-                _GRASP_CONTROLLERS.on_mode_transition()
+            if mode_changed:
                 if current_mode == StreamMode.POSE:
                     pose_streamer.on_mode_exit()
 
@@ -2090,7 +2094,7 @@ def run_pico_manager(
                 planner_streamer.run_once(new_mode)
 
             # Make sure to send command messages after loop iteration to ensure data arrives before mode switch
-            if new_mode != current_mode:
+            if mode_changed:
                 if new_mode == StreamMode.OFF:
                     socket.send(build_command_message(start=False, stop=True, planner=True))
                     exit()
