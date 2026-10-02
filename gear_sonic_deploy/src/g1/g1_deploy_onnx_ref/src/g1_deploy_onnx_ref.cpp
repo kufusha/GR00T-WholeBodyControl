@@ -4515,8 +4515,8 @@ int main(int argc, char const* argv[]) {
   );
   std::cout << "[DEBUG] G1Deploy object created successfully!" << std::endl;
 
-  // SIGINT/SIGTERM only set an atomic flag. Cleanup and hand motion remain in
-  // the normal main-thread shutdown path rather than running in a signal handler.
+  // SIGINT/SIGTERM only set an atomic flag. Cleanup remains in the normal
+  // main-thread shutdown path rather than running in a signal handler.
   std::signal(SIGINT, requestGracefulShutdown);
   std::signal(SIGTERM, requestGracefulShutdown);
   

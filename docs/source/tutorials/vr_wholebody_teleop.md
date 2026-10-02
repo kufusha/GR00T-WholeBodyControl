@@ -258,8 +258,11 @@ Below is the **recovery procedure** — if you accidentally enter a badly calibr
 | **Toggle VR_3PT** | **Left Stick Click** | From any Planner mode → VR_3PT (triggers CALIB). Click again to return. |
 | **Hand grasp** | **Trigger** (per hand) | Controls the corresponding hand's grasp. |
 
-On a normal stop, policy OFF, `SIGINT`, or `SIGTERM`, the deploy process
-commands the configured protective hand pose before shutting down.
+On a normal stop, policy OFF, `SIGINT`, or `SIGTERM`, the deploy process stops
+periodic Inspire command publication after its final writer pass. It does not
+command a dedicated protective hand pose. With the force-safe service described
+below, a subsequent DDS command timeout replaces the previous target with the
+latest measured hand position.
 
 #### RH56 force protection (real robot)
 
@@ -279,7 +282,9 @@ test object, and an external force gauge:
 
 Do not copy calibration coefficients from another hand. The force response is
 finger- and device-specific. Sensor failure blocks further closure but still
-allows opening. `SIGKILL` and power loss bypass the software shutdown pose.
+allows opening. `SIGKILL` skips GEAR-SONIC's normal cleanup, although the
+force-safe service still applies its command timeout if it remains running.
+Power loss bypasses software handling entirely.
 
 ### Joystick Controls (Planner Modes)
 
