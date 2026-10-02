@@ -233,7 +233,21 @@ else()
 endif()
 
 # test executable:
+include(CTest)
 include(FetchContent)
+
+if(BUILD_TESTING)
+  add_executable(inspire_command_validation_test
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/inspire_command_validation_test.cpp)
+  add_test(
+    NAME inspire_command_validation
+    COMMAND inspire_command_validation_test)
+  set_target_properties(
+    inspire_command_validation_test
+    PROPERTIES CXX_STANDARD 20
+               CXX_STANDARD_REQUIRED ON
+               CXX_EXTENSIONS OFF)
+endif()
 
 # Download and make GoogleTest available
 FetchContent_Declare(

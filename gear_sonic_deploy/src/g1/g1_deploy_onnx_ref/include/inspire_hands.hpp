@@ -1,6 +1,8 @@
 #ifndef INSPIRE_HANDS_HPP
 #define INSPIRE_HANDS_HPP
 
+#include "inspire_feedback_protocol.hpp"
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -52,7 +54,6 @@ public:
     // upstream position-only service documents as reserved. An unmodified
     // service continues to ignore these fields and still follows q().
     static constexpr uint8_t SAFETY_PROTOCOL_MODE = 1;
-    static constexpr uint32_t SAFETY_PROTOCOL_MAGIC = 0x494E5350;  // "INSP"
     static constexpr double TELEOP_CLOSING_SPEED_RAW = 500.0;
     static constexpr double PROTECTIVE_CLOSING_SPEED_RAW = 25.0;
     static constexpr double OPENING_SPEED_RAW = 1000.0;
@@ -116,8 +117,18 @@ public:
                 }
 
                 has_actual_state_ = true;
-                has_force_feedback_ =
-                    state->states()[0].reserve()[0] == SAFETY_PROTOCOL_MAGIC;
+                const auto right_magic = state->states()[0].reserve()[
+                    inspire::protocol::SAFETY_PROTOCOL_MAGIC_INDEX];
+                const auto left_magic = state->states()[INSPIRE_DOF].reserve()[
+                    inspire::protocol::SAFETY_PROTOCOL_MAGIC_INDEX];
+                force_feedback_valid_ =
+                    inspire::protocol::decodeForceFeedbackValidity(
+                        right_magic,
+                        state->states()[0].reserve()[
+                            inspire::protocol::FORCE_FEEDBACK_STATUS_INDEX],
+                        left_magic,
+                        state->states()[INSPIRE_DOF].reserve()[
+                            inspire::protocol::FORCE_FEEDBACK_STATUS_INDEX]);
             },
             1);
 
@@ -412,7 +423,11 @@ public:
         {
             force[i] = actual_force_n_[offset + i];
         }
-        return {has_actual_state_ && has_force_feedback_, force};
+        const std::size_t side = is_left ? 1 : 0;
+        return {
+            has_actual_state_ && force_feedback_valid_[side],
+            force
+        };
     }
 
 private:
@@ -622,7 +637,7 @@ private:
     std::array<double, TOTAL_INSPIRE_DOF>
         actual_force_n_{};
     bool has_actual_state_ = false;
-    bool has_force_feedback_ = false;
+    std::array<bool, 2> force_feedback_valid_{};
 
     // DDS command reused by the 500-Hz writer thread.
     unitree_go::msg::dds_::MotorCmds_
