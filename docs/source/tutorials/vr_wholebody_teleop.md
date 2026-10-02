@@ -52,6 +52,18 @@ source .venv_teleop/bin/activate
 python gear_sonic/scripts/run_sim_loop.py
 ```
 
+To simulate the bimanual Inspire RH56DFX hands instead of the default Dex3
+hands, select the hand model explicitly:
+
+```bash
+python gear_sonic/scripts/run_sim_loop.py --hand-type inspire
+```
+
+This keeps the three-terminal workflow unchanged. The simulator subscribes to
+the same `rt/inspire/cmd` command published by the deployment process and
+publishes simulated feedback on `rt/inspire/state`. Inspire command order is
+`right[0:6], left[6:12]`, matching `dfx_inspire_service`.
+
 ### Terminal 2 — C++ Deployment
 
 From `gear_sonic_deploy/`:
