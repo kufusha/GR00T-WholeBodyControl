@@ -5,6 +5,8 @@ import unittest
 
 import mujoco
 
+from gear_sonic.utils.mujoco_sim.configs import SimLoopConfig
+
 
 ROOT = Path(__file__).resolve().parents[2]
 MODEL_DIR = ROOT / "gear_sonic/data/robot_model/model_data/g1"
@@ -17,6 +19,9 @@ class ValveFixtureModelTests(unittest.TestCase):
         spec = importlib.util.spec_from_file_location("object_scene_loader", LOADER_PATH)
         self.loader = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(self.loader)
+
+    def test_object_loading_is_opt_in(self):
+        self.assertIsNone(SimLoopConfig().object_load)
 
     def test_vertical_fixture_is_composed_with_g1_and_inspire_hands(self):
         model = self.loader.load_g1_with_rh56dfx_and_valve(
