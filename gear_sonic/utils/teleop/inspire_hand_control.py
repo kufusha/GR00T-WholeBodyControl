@@ -60,8 +60,15 @@ class TriggerGraspController:
             dt = max(0.0, min(now - self.last_update_time, 0.1))
             self.last_update_time = now
 
+            if not trigger_valid:
+                self.active = False
+                self.full_grasp_mode = False
+                self.release_required = True
+                self.closure = 0.0
+                return 0.0
+
             if self.release_required:
-                if not trigger_valid or trigger > self.release_threshold:
+                if trigger > self.release_threshold:
                     return 0.0
                 self.release_required = False
 

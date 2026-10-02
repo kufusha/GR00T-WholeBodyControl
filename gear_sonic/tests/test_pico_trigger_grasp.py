@@ -159,6 +159,18 @@ def test_non_finite_trigger_opens_hand_safely():
         assert _update(controller, trigger, 1.0) == 0.0
 
 
+def test_non_finite_trigger_requires_a_finite_release_before_rearming():
+    for trigger in (np.nan, np.inf, -np.inf):
+        controller = TriggerGraspController(max_closure_rate=100.0)
+
+        assert _update(controller, 0.8, 0.0) == 0.4
+        assert _update(controller, trigger, 1.0) == 0.0
+        assert _update(controller, 1.0, 1.0) == 0.0
+
+        assert _update(controller, 0.0, 1.0) == 0.0
+        assert _update(controller, 1.0, 1.0) == 1.0
+
+
 def test_non_finite_grip_disables_full_grasp():
     for grip in (np.nan, np.inf, -np.inf):
         controller = TriggerGraspController(max_closure_rate=100.0)
