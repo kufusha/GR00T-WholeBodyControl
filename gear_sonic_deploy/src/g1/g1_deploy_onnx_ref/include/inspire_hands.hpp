@@ -6,7 +6,6 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <cmath>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -55,7 +54,6 @@ public:
     // service continues to ignore these fields and still follows q().
     static constexpr uint8_t SAFETY_PROTOCOL_MODE = 1;
     static constexpr double TELEOP_CLOSING_SPEED_RAW = 500.0;
-    static constexpr double PROTECTIVE_CLOSING_SPEED_RAW = 25.0;
     static constexpr double OPENING_SPEED_RAW = 1000.0;
     static constexpr double DEFAULT_FORCE_LIMIT_G = 100.0;
 
@@ -144,11 +142,10 @@ public:
         {
             dds_command_.cmds()[i].mode() = SAFETY_PROTOCOL_MODE;
             dds_command_.cmds()[i].q() = 1.0;
-            dds_command_.cmds()[i].dq() = PROTECTIVE_CLOSING_SPEED_RAW;
+            dds_command_.cmds()[i].dq() = TELEOP_CLOSING_SPEED_RAW;
             dds_command_.cmds()[i].tau() = DEFAULT_FORCE_LIMIT_G;
         }
 
-        shutdown_pose_active_.store(false, std::memory_order_relaxed);
         commands_enabled_.store(false, std::memory_order_relaxed);
     }
 
@@ -246,38 +243,6 @@ public:
     }
 
     /**
-     * @brief Override normal teleoperation with the measured protective pose.
-     *
-     * Separate constants are kept for each hand so the left-hand calibration
-     * can be updated independently when measured. The current left values use
-     * the same normalized actuator targets as the measured right hand.
-     */
-    void activateShutdownPose()
-    {
-        shutdown_pose_active_.store(true, std::memory_order_release);
-        commands_enabled_.store(true, std::memory_order_release);
-    }
-
-    bool shutdownPoseReached(double tolerance = 0.03) const
-    {
-        std::lock_guard<std::mutex> lock(state_mutex_);
-        if (!has_actual_state_)
-        {
-            return false;
-        }
-
-        for (int i = 0; i < INSPIRE_DOF; ++i)
-        {
-            if (std::abs(actual_inspire_state_[i] - RIGHT_SHUTDOWN_POSE[i]) > tolerance ||
-                std::abs(actual_inspire_state_[i + INSPIRE_DOF] - LEFT_SHUTDOWN_POSE[i]) > tolerance)
-            {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    /**
      * @brief Publish one Inspire hand command.
      *
      * Called from G1Deploy's command writer thread.
@@ -290,8 +255,7 @@ public:
         }
 
         // Startup is observation-only. InitControl must not move the hands;
-        // publishing begins with the first explicit teleop command or the
-        // protective shutdown command.
+        // publishing begins with the first explicit teleop command.
         if (!commands_enabled_.load(std::memory_order_acquire))
         {
             return;
@@ -312,20 +276,10 @@ public:
         const double force_limit_g =
             force_limit_g_.load(std::memory_order_relaxed);
 
-        InspireCommand left_inspire;
-        InspireCommand right_inspire;
-        const bool shutdown_pose_active =
-            shutdown_pose_active_.load(std::memory_order_acquire);
-        if (shutdown_pose_active)
-        {
-            left_inspire = LEFT_SHUTDOWN_POSE;
-            right_inspire = RIGHT_SHUTDOWN_POSE;
-        }
-        else
-        {
-            left_inspire = dex3ToInspire(left, true, max_close_ratio);
-            right_inspire = dex3ToInspire(right, false, max_close_ratio);
-        }
+        const InspireCommand left_inspire =
+            dex3ToInspire(left, true, max_close_ratio);
+        const InspireCommand right_inspire =
+            dex3ToInspire(right, false, max_close_ratio);
 
         std::array<double, TOTAL_INSPIRE_DOF> actual_state{};
         bool has_actual_state = false;
@@ -346,13 +300,7 @@ public:
             dds_command_.cmds()[i + INSPIRE_DOF].q() =
                 left_inspire[i];
 
-            // Inspire q decreases while closing. Normal teleoperation uses a
-            // responsive speed, while the shutdown pose remains deliberately
-            // slow to protect the fingers.
-            const double closing_speed =
-                shutdown_pose_active
-                    ? PROTECTIVE_CLOSING_SPEED_RAW
-                    : TELEOP_CLOSING_SPEED_RAW;
+            // Inspire q decreases while closing.
             const bool right_opening =
                 has_actual_state && right_inspire[i] >= actual_state[i];
             const bool left_opening =
@@ -360,9 +308,9 @@ public:
                 left_inspire[i] >= actual_state[i + INSPIRE_DOF];
 
             dds_command_.cmds()[i].dq() =
-                right_opening ? OPENING_SPEED_RAW : closing_speed;
+                right_opening ? OPENING_SPEED_RAW : TELEOP_CLOSING_SPEED_RAW;
             dds_command_.cmds()[i + INSPIRE_DOF].dq() =
-                left_opening ? OPENING_SPEED_RAW : closing_speed;
+                left_opening ? OPENING_SPEED_RAW : TELEOP_CLOSING_SPEED_RAW;
             dds_command_.cmds()[i].tau() = force_limit_g;
             dds_command_.cmds()[i + INSPIRE_DOF].tau() = force_limit_g;
         }
@@ -431,14 +379,6 @@ public:
     }
 
 private:
-    // Measured actuator targets, normalized from the PC tool's 0..1000 units.
-    inline static constexpr InspireCommand RIGHT_SHUTDOWN_POSE = {
-        1.0, 1.0, 1.0, 1.0, 1.0, 0.0
-    };
-    inline static constexpr InspireCommand LEFT_SHUTDOWN_POSE = {
-        1.0, 1.0, 1.0, 1.0, 1.0, 0.0
-    };
-
     /**
      * @brief Convert a Dex3 joint position to [0, 1] closure ratio.
      *
@@ -648,9 +588,6 @@ private:
 
     std::atomic<double>
         force_limit_g_{DEFAULT_FORCE_LIMIT_G};
-
-    std::atomic<bool>
-        shutdown_pose_active_{false};
 
     std::atomic<bool>
         commands_enabled_{false};

@@ -2725,24 +2725,6 @@ class G1Deploy {
     void Stop() {
       operator_state.stop = true;
 
-      // Keep the 500-Hz writer alive while both hands move to the measured
-      // protective pose. Feedback may be unavailable during simulation, so
-      // use a bounded wait and still publish the pose for the full timeout.
-      inspire_hands_.activateShutdownPose();
-      const auto hand_shutdown_deadline =
-          std::chrono::steady_clock::now() + std::chrono::milliseconds(1500);
-      bool hand_shutdown_reached = false;
-      while (std::chrono::steady_clock::now() < hand_shutdown_deadline) {
-        if (inspire_hands_.shutdownPoseReached()) {
-          hand_shutdown_reached = true;
-          break;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
-      }
-      std::cout << "[InspireHands] Protective shutdown pose "
-                << (hand_shutdown_reached ? "reached" : "commanded (feedback timeout)")
-                << std::endl;
-
       if (control_thread_ptr_) {
         input_thread_ptr_->Wait();
         input_thread_ptr_.reset();
