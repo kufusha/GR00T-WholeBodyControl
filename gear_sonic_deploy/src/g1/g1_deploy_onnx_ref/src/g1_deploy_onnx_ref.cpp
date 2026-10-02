@@ -138,6 +138,7 @@
 
 // Inspire hands
 #include "../include/inspire_hands.hpp"
+#include "../include/inspire_command_validation.hpp"
 
 // Error monitor
 #include "../include/error_monitor.hpp"
@@ -4490,8 +4491,8 @@ int main(int argc, char const* argv[]) {
         std::cerr << "Error: Invalid Inspire force limit: " << argv[i] << std::endl;
         exit(1);
       }
-      if (inspire_force_limit_g < 1.0 || inspire_force_limit_g > 1000.0) {
-        std::cerr << "Error: --inspire-force-limit-g must be between 1 and 1000" << std::endl;
+      if (!inspire::validation::isValidForceLimitGrams(inspire_force_limit_g)) {
+        std::cerr << "Error: --inspire-force-limit-g must be finite and between 1 and 1000" << std::endl;
         exit(1);
       }
       std::cout << "[INFO] Inspire force limit set to: "
