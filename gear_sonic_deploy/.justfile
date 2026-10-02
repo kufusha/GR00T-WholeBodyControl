@@ -27,9 +27,9 @@ build *build_type='Release':
 run *package='hello':
   @./target/release/{{package}}
 
-# Run code quality tools
-test:
-  @echo "Running tests..."
+# Build and run registered CTest targets
+test: build
+  @ctest --test-dir build --output-on-failure
 
 # Remove build artifacts and non-essential files
 clean:
@@ -41,4 +41,3 @@ clean:
 check:
   @echo "Running code quality tools..."
   @cppcheck --error-exitcode=1 --project=build/compile_commands.json -i build/_deps/
-

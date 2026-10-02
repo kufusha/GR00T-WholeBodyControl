@@ -4467,16 +4467,14 @@ int main(int argc, char const* argv[]) {
         std::cerr << "Error: --inspire-force-limit-g requires a value argument" << std::endl;
         exit(1);
       }
-      try {
-        inspire_force_limit_g = std::stod(argv[++i]);
-      } catch (...) {
-        std::cerr << "Error: Invalid Inspire force limit: " << argv[i] << std::endl;
-        exit(1);
-      }
-      if (!inspire::validation::isValidForceLimitGrams(inspire_force_limit_g)) {
+      const std::string force_limit_text = argv[++i];
+      const auto parsed_force_limit =
+          inspire::validation::parseForceLimitGrams(force_limit_text);
+      if (!parsed_force_limit) {
         std::cerr << "Error: --inspire-force-limit-g must be finite and between 1 and 1000" << std::endl;
         exit(1);
       }
+      inspire_force_limit_g = *parsed_force_limit;
       std::cout << "[INFO] Inspire force limit set to: "
                 << inspire_force_limit_g << " g" << std::endl;
     }

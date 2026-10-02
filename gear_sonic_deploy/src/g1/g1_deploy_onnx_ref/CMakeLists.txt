@@ -233,7 +233,6 @@ else()
 endif()
 
 # test executable:
-include(CTest)
 include(FetchContent)
 
 if(BUILD_TESTING)

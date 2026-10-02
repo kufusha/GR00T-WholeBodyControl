@@ -1,6 +1,7 @@
 #ifndef INSPIRE_HANDS_HPP
 #define INSPIRE_HANDS_HPP
 
+#include "inspire_command_frame.hpp"
 #include "inspire_feedback_protocol.hpp"
 
 #include <algorithm>
@@ -52,9 +53,12 @@ public:
     // Extended dfx_inspire_service protocol carried in fields that the
     // upstream position-only service documents as reserved. An unmodified
     // service continues to ignore these fields and still follows q().
-    static constexpr uint8_t SAFETY_PROTOCOL_MODE = 1;
-    static constexpr double TELEOP_CLOSING_SPEED_RAW = 500.0;
-    static constexpr double OPENING_SPEED_RAW = 1000.0;
+    static constexpr uint8_t SAFETY_PROTOCOL_MODE =
+        inspire::command::kSafetyProtocolMode;
+    static constexpr double TELEOP_CLOSING_SPEED_RAW =
+        inspire::command::kTeleopClosingSpeedRaw;
+    static constexpr double OPENING_SPEED_RAW =
+        inspire::command::kOpeningSpeedRaw;
     static constexpr double DEFAULT_FORCE_LIMIT_G = 100.0;
 
     using Dex3Command = std::array<double, DEX3_DOF>;
@@ -289,30 +293,18 @@ public:
             has_actual_state = has_actual_state_;
         }
 
-        // dfx_inspire_service convention:
-        //   0..5  = right hand
-        //   6..11 = left hand
-        for (int i = 0; i < INSPIRE_DOF; ++i)
+        const auto frame = inspire::command::buildCommandFrame(
+            right_inspire,
+            left_inspire,
+            actual_state,
+            has_actual_state,
+            force_limit_g);
+        for (int i = 0; i < TOTAL_INSPIRE_DOF; ++i)
         {
-            dds_command_.cmds()[i].q() =
-                right_inspire[i];
-
-            dds_command_.cmds()[i + INSPIRE_DOF].q() =
-                left_inspire[i];
-
-            // Inspire q decreases while closing.
-            const bool right_opening =
-                has_actual_state && right_inspire[i] >= actual_state[i];
-            const bool left_opening =
-                has_actual_state &&
-                left_inspire[i] >= actual_state[i + INSPIRE_DOF];
-
-            dds_command_.cmds()[i].dq() =
-                right_opening ? OPENING_SPEED_RAW : TELEOP_CLOSING_SPEED_RAW;
-            dds_command_.cmds()[i + INSPIRE_DOF].dq() =
-                left_opening ? OPENING_SPEED_RAW : TELEOP_CLOSING_SPEED_RAW;
-            dds_command_.cmds()[i].tau() = force_limit_g;
-            dds_command_.cmds()[i + INSPIRE_DOF].tau() = force_limit_g;
+            dds_command_.cmds()[i].mode() = frame[i].mode;
+            dds_command_.cmds()[i].q() = frame[i].position;
+            dds_command_.cmds()[i].dq() = frame[i].speed_raw;
+            dds_command_.cmds()[i].tau() = frame[i].force_limit_g;
         }
 
         publisher_->Write(dds_command_);
