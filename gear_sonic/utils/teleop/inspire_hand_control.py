@@ -6,6 +6,13 @@ import time
 import numpy as np
 
 
+def _finite_unit_interval(value: float, fallback: float = 0.0) -> float:
+    value = float(value)
+    if not np.isfinite(value):
+        return fallback
+    return float(np.clip(value, 0.0, 1.0))
+
+
 class TriggerGraspController:
     """Convert analog Trigger/Grip input into a safe grasp closure.
 
@@ -33,8 +40,8 @@ class TriggerGraspController:
         self._lock = threading.Lock()
 
     def update(self, trigger: float, grip: float) -> float:
-        trigger = float(np.clip(trigger, 0.0, 1.0))
-        grip = float(np.clip(grip, 0.0, 1.0))
+        trigger = _finite_unit_interval(trigger)
+        grip = _finite_unit_interval(grip)
 
         with self._lock:
             now = time.monotonic()
@@ -70,7 +77,7 @@ def inspire_closure_to_dex3(closure: float, hand: str) -> np.ndarray:
     adapter converts this 7-DOF command back to Inspire's
     [pinky, ring, middle, index, thumb_bend, thumb_rotate] convention.
     """
-    closure = float(np.clip(closure, 0.0, 1.0))
+    closure = _finite_unit_interval(closure)
     if hand == "left":
         thumb_bend_closure = 1.0 - 0.896
         thumb_rotate_closure = 1.0 - 0.0
