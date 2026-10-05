@@ -268,7 +268,7 @@ Common options:
 | Flag | Default | Description |
 |---|---|---|
 | `--task-prompt` | `"demo"` | Language task description (e.g., `"pick up the cup"`) |
-| `--dataset-name` | *(auto: timestamp)* | Dataset name; omit to auto-generate |
+| `--dataset-name` | *(auto: timestamp + task)* | Dataset name; omit to auto-generate |
 | `--sim / --no-sim` | `False` | Run deploy.sh in sim mode (also starts the sim loop) |
 | `--camera-host` | `localhost` | Camera server host (e.g., `192.168.123.164` for real robot) |
 | `--camera-port` | `5555` | Camera server port |
@@ -357,8 +357,9 @@ All options are provided via CLI flags — no interactive prompts.  Key flags:
 | `--root-output-dir` | `outputs` | Parent directory for saved datasets |
 
 ```{tip}
-Datasets are saved under `<root-output-dir>/<dataset-name>/`.  If `--dataset-name`
-is not specified, a timestamped name is generated automatically.
+Datasets are saved under `<root-output-dir>/<dataset-name>/`. If `--dataset-name`
+is not specified, the exporter combines the collection timestamp with a
+filesystem-safe slug derived from `--task-prompt`.
 ```
 
 ### Recording Controls
@@ -380,6 +381,67 @@ These buttons work in any manager mode (POSE, PLANNER, etc.) and are independent
 |---|---|
 | `c` | **Toggle** recording (same as Left Grip + A) |
 | `x` | **Discard** episode (same as Left Grip + B — flagged for removal) |
+
+### Inspire Valve Demonstrations in MuJoCo
+
+The valve recorder extends the existing simulation collection stack; it does
+not create a separate dataset format or a real-robot recording path. Start the
+vertical valve scene with two-hand labeling as follows:
+
+```bash
+python gear_sonic/scripts/launch_data_collection.py \
+    --sim \
+    --inspire-valve \
+    --valve-orientation vertical \
+    --valve-hand-mode two_hand \
+    --valve-target-angle-deg -90 \
+    --valve-tolerance-deg 5 \
+    --task-prompt "grasp and turn the circular valve clockwise"
+```
+
+Select the horizontal fixture with the same stack by changing only the
+orientation option:
+
+```bash
+python gear_sonic/scripts/launch_data_collection.py \
+    --sim \
+    --inspire-valve \
+    --valve-orientation horizontal \
+    --valve-hand-mode two_hand \
+    --valve-target-angle-deg -90 \
+    --valve-tolerance-deg 5 \
+    --task-prompt "grasp and turn the horizontal circular valve clockwise"
+```
+
+The target sign follows the MuJoCo hinge axis. For the fixtures above, a
+negative angle is clockwise when the vertical wheel is viewed by the robot or
+the horizontal wheel is viewed from above. Use `left_only` or `right_only` for
+separately labeled one-hand sessions. The mode is an episode label and operator
+instruction; it does not suppress the other hand command. Recording and
+discard controls remain **Left Grip + A** and **Left Grip + B**.
+
+`--valve-orientation` accepts `vertical` (the default, mapped to
+`--object-load valve`) and `horizontal` (mapped to
+`--object-load valve-horizontal`). The selected orientation is stored in both
+the dataset configuration and each episode's metadata.
+
+The simulator publishes raw Inspire and valve telemetry on port `5558` by
+default. Valve frames are skipped when that source is missing, stale,
+malformed, future-dated, or non-finite. Episode metadata records the target,
+tolerance, result, sample/drop counts, source age, fixture configuration, and
+hand-use label.
+
+Additional LeRobot fields use `left[0:6], right[0:6]` order:
+
+- `observation.inspire.position`: normalized simulated `MotorState.q`
+- `action.inspire.position`: normalized received `MotorCmd.q`
+- `observation.sim.valve_angle`: unwrapped angle from the episode start
+
+These fields follow the original `dfx_inspire_service` position-only DDS
+contract (`0` closed, `1` open). They are auxiliary validation and evaluation
+data and do not change the existing GR00T modality or 78-dimensional SONIC
+action. Force, tactile, velocity, torque, speed, and force-limit fields are not
+recorded in this mode.
 
 ```{note}
 Keyboard commands are sent via a separate ZMQ publisher (default port `5580`). The data exporter subscribes to this channel automatically. You can send keys from any ZMQ publisher on that port, or integrate with the C++ deployment's keyboard handler.

@@ -11,15 +11,31 @@ Joint names, counts, and group indices are derived at runtime from the
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
-from gear_sonic.data.robot_model import RobotModel
+if TYPE_CHECKING:
+    from gear_sonic.data.robot_model import RobotModel
 
 EGO_VIEW_HEIGHT: int = 480
 EGO_VIEW_WIDTH: int = 640
 WRIST_VIEW_HEIGHT: int = 480
 WRIST_VIEW_WIDTH: int = 640
 FPS: int = 50
+
+INSPIRE_DATASET_NAMES = [
+    "left_pinky",
+    "left_ring",
+    "left_middle",
+    "left_index",
+    "left_thumb_bend",
+    "left_thumb_rotate",
+    "right_pinky",
+    "right_ring",
+    "right_middle",
+    "right_index",
+    "right_thumb_bend",
+    "right_thumb_rotate",
+]
 
 
 _JOINT_GROUPS_FOR_STATE: list[str] = [
@@ -392,6 +408,20 @@ def get_wrist_camera_modality_config() -> dict:
             "left_wrist": {"original_key": "observation.images.left_wrist"},
             "right_wrist": {"original_key": "observation.images.right_wrist"},
         },
+    }
+
+
+def get_inspire_valve_features() -> dict:
+    """Return auxiliary Inspire position and valve evaluation fields."""
+    scalar = lambda name: {"dtype": "float32", "shape": (1,), "names": [name]}
+    return {
+        "observation.inspire.position": {
+            "dtype": "float32", "shape": (12,), "names": INSPIRE_DATASET_NAMES,
+        },
+        "action.inspire.position": {
+            "dtype": "float32", "shape": (12,), "names": INSPIRE_DATASET_NAMES,
+        },
+        "observation.sim.valve_angle": scalar("angle_rad"),
     }
 
 

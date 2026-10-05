@@ -349,5 +349,11 @@ class SimLoopConfig(BaseConfig):
     camera_port: int = 5555
     """Camera port for image publishing"""
 
+    enable_simulation_telemetry: bool = False
+    """Publish simulation-only Inspire and valve telemetry."""
+
+    simulation_telemetry_port: int = 5558
+    """Port for simulation-only telemetry."""
+
     verbose: bool = False
     """Verbose output, override the base config verbose"""

@@ -45,6 +45,15 @@ def main(config: ArgsConfig):
         wbc_config["NUM_HAND_JOINTS"] = 6
         wbc_config["OBJECT_LOAD"] = config.object_load
 
+    wbc_config["ENABLE_SIMULATION_TELEMETRY"] = config.enable_simulation_telemetry
+    wbc_config["SIMULATION_TELEMETRY_PORT"] = config.simulation_telemetry_port
+
+    if config.enable_simulation_telemetry:
+        if config.hand_type != "inspire":
+            raise ValueError("--enable-simulation-telemetry requires --hand-type inspire")
+        if config.object_load not in {"valve", "valve-vertical", "valve-horizontal"}:
+            raise ValueError("--enable-simulation-telemetry requires a named valve object")
+
     if config.object_load is not None and config.hand_type != "inspire":
         raise ValueError("--object-load currently requires --hand-type inspire")
 

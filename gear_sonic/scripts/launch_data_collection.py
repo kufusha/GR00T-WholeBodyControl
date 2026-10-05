@@ -35,13 +35,16 @@ Usage (from repo root — no venv activation needed):
 
 from dataclasses import dataclass
 from pathlib import Path
+import math
 import os
+import shlex
 import shutil
 import signal
 import socket
 import subprocess
 import sys
 import time
+from typing import Literal
 
 
 def _bootstrap_venv():
@@ -151,6 +154,15 @@ class DataCollectionLaunchConfig:
     text_to_speech: bool = True
     """Enable voice feedback via espeak (data exporter)."""
 
+    inspire_valve: bool = False
+    """Collect Inspire valve demonstrations in MuJoCo."""
+
+    simulation_telemetry_port: int = 5558
+    valve_hand_mode: str = "two_hand"
+    valve_orientation: Literal["vertical", "horizontal"] = "vertical"
+    valve_target_angle_deg: float | None = None
+    valve_tolerance_deg: float | None = None
+
     # Camera viewer
     camera_viewer: bool = True
     """Start the camera viewer pane."""
@@ -163,6 +175,79 @@ class DataCollectionLaunchConfig:
 
 
 SESSION_NAME = "sonic_data_collection"
+
+
+def validate_launch_config(config: DataCollectionLaunchConfig) -> None:
+    if config.inspire_valve and not config.sim:
+        raise ValueError("--inspire-valve requires --sim")
+    if config.inspire_valve and config.valve_target_angle_deg is None:
+        raise ValueError("--inspire-valve requires --valve-target-angle-deg")
+    if config.inspire_valve and not math.isfinite(config.valve_target_angle_deg):
+        raise ValueError("--inspire-valve requires a finite target angle")
+    if config.inspire_valve and config.valve_tolerance_deg is None:
+        raise ValueError("--inspire-valve requires --valve-tolerance-deg")
+    if config.inspire_valve and (
+        not math.isfinite(config.valve_tolerance_deg)
+        or config.valve_tolerance_deg <= 0
+    ):
+        raise ValueError("--inspire-valve requires a positive finite tolerance")
+    if config.valve_hand_mode not in {"two_hand", "left_only", "right_only"}:
+        raise ValueError("Invalid --valve-hand-mode")
+    if config.valve_orientation not in {"vertical", "horizontal"}:
+        raise ValueError("Invalid --valve-orientation")
+    if config.simulation_telemetry_port <= 0:
+        raise ValueError("--simulation-telemetry-port must be positive")
+    if config.data_exporter_frequency <= 0:
+        raise ValueError("--data-exporter-frequency must be positive")
+
+
+def _build_sim_command(config: DataCollectionLaunchConfig, repo_root: Path) -> str:
+    command = (
+        f"cd {shlex.quote(str(repo_root))} && "
+        "source .venv_sim/bin/activate && "
+        "python gear_sonic/scripts/run_sim_loop.py "
+        f"--enable-image-publish --enable-offscreen --camera-port {config.camera_port}"
+    )
+    if config.inspire_valve:
+        object_load = (
+            "valve-horizontal"
+            if config.valve_orientation == "horizontal"
+            else "valve"
+        )
+        command += (
+            f" --hand-type inspire --object-load {object_load}"
+            " --enable-simulation-telemetry"
+            f" --simulation-telemetry-port {config.simulation_telemetry_port}"
+        )
+    return command
+
+
+def _build_exporter_command(config: DataCollectionLaunchConfig, repo_root: Path) -> str:
+    command = (
+        f"cd {shlex.quote(str(repo_root))} && "
+        "source .venv_data_collection/bin/activate && "
+        "python gear_sonic/scripts/run_data_exporter.py "
+        f"--task-prompt {shlex.quote(config.task_prompt)} "
+        f"--data-collection-frequency {config.data_exporter_frequency} "
+        f"--camera-host {shlex.quote(config.camera_host)} "
+        f"--camera-port {config.camera_port}"
+    )
+    if config.dataset_name:
+        command += f" --dataset-name {shlex.quote(config.dataset_name)}"
+    if config.record_wrist_cameras:
+        command += " --record-wrist-cameras"
+    if not config.text_to_speech:
+        command += " --no-text-to-speech"
+    if config.inspire_valve:
+        command += (
+            " --inspire-valve"
+            f" --simulation-telemetry-port {config.simulation_telemetry_port}"
+            f" --valve-hand-mode {config.valve_hand_mode}"
+            f" --valve-orientation {config.valve_orientation}"
+            f" --valve-target-angle-deg {config.valve_target_angle_deg}"
+            f" --valve-tolerance-deg {config.valve_tolerance_deg}"
+        )
+    return command
 
 
 def _check_prerequisites(config: DataCollectionLaunchConfig):
@@ -288,6 +373,7 @@ def _check_pane_alive(pane_index: int) -> bool:
 def main(config: DataCollectionLaunchConfig):
     repo_root = Path(__file__).resolve().parent.parent.parent
 
+    validate_launch_config(config)
     _check_prerequisites(config)
     _kill_existing_session()
 
@@ -306,6 +392,12 @@ def main(config: DataCollectionLaunchConfig):
     print(f"  Camera viewer:   {'Yes' if config.camera_viewer else 'No'}")
     print(f"  Wrist cameras:   {'Yes' if config.record_wrist_cameras else 'No'}")
     print(f"  Text-to-speech:  {'Yes' if config.text_to_speech else 'No'}")
+    if config.inspire_valve:
+        print(f"  Valve hands:     {config.valve_hand_mode}")
+        print(f"  Valve fixture:   {config.valve_orientation}")
+        print(f"  Valve target:    {config.valve_target_angle_deg} deg")
+        print(f"  Valve tolerance: {config.valve_tolerance_deg} deg")
+        print(f"  Sim telemetry:   localhost:{config.simulation_telemetry_port}")
     print(f"  PC IP (for PICO): {_get_local_ip()}")
     print(f"  Teleop vis:      vr3pt={config.pico_vis_vr3pt} smpl={config.pico_vis_smpl}")
     print("=" * 60)
@@ -318,13 +410,7 @@ def main(config: DataCollectionLaunchConfig):
         subprocess.run(
             ["tmux", "new-window", "-t", SESSION_NAME, "-n", "sim"],
         )
-        sim_cmd = (
-            f"cd {repo_root} && "
-            f"source .venv_sim/bin/activate && "
-            f"python gear_sonic/scripts/run_sim_loop.py "
-            f"--enable-image-publish --enable-offscreen "
-            f"--camera-port {config.camera_port}"
-        )
+        sim_cmd = _build_sim_command(config, repo_root)
         sim_target = f"{SESSION_NAME}:sim"
         subprocess.run(
             ["tmux", "send-keys", "-t", sim_target, sim_cmd, "C-m"],
@@ -399,21 +485,7 @@ def main(config: DataCollectionLaunchConfig):
         _send_to_pane(3, viewer_cmd, wait=2.0)
 
     # --- Pane 1 (top-right): Data Exporter ---
-    exporter_cmd = (
-        f"cd {repo_root} && "
-        f"source .venv_data_collection/bin/activate && "
-        f"python gear_sonic/scripts/run_data_exporter.py "
-        f"--task-prompt '{config.task_prompt}' "
-        f"--data-collection-frequency {config.data_exporter_frequency} "
-        f"--camera-host {config.camera_host} "
-        f"--camera-port {config.camera_port}"
-    )
-    if config.dataset_name:
-        exporter_cmd += f" --dataset-name '{config.dataset_name}'"
-    if config.record_wrist_cameras:
-        exporter_cmd += " --record-wrist-cameras"
-    if not config.text_to_speech:
-        exporter_cmd += " --no-text-to-speech"
+    exporter_cmd = _build_exporter_command(config, repo_root)
 
     print("Starting data exporter (pane 1)...")
     _send_to_pane(2, exporter_cmd, wait=1.0)

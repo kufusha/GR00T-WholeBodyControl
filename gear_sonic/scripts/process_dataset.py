@@ -52,6 +52,10 @@ from typing import Optional
 import av
 import numpy as np
 import pandas as pd
+
+from gear_sonic.utils.data_collection.episode_metadata import (
+    build_processed_episode_metadata,
+)
 import tyro
 
 
@@ -394,11 +398,9 @@ def write_output_dataset(
                 else:
                     shutil.copy2(src_video, dst_video)
 
-        ep_meta = {
-            "episode_index": i,
-            "tasks": ep["episode_meta"].get("tasks", []),
-            "length": ep_len,
-        }
+        ep_meta = build_processed_episode_metadata(
+            ep["episode_meta"], episode_index=i, length=ep_len
+        )
         episodes_jsonl.append(ep_meta)
 
         total_frames += ep_len

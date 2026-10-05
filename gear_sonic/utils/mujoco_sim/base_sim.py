@@ -21,12 +21,14 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize
 
+from gear_sonic.camera.sensor_server import SensorServer
 from gear_sonic.utils.mujoco_sim.metric_utils import check_contact, check_height
 from gear_sonic.utils.mujoco_sim.inspire_sim_mapping import (
     actuator_indices_for_joints,
     control_array_to_normalized,
     normalized_array_to_control,
 )
+from gear_sonic.utils.mujoco_sim.simulation_telemetry import build_simulation_telemetry
 from gear_sonic.utils.mujoco_sim.sim_utils import get_subtree_body_names
 from gear_sonic.utils.mujoco_sim.unitree_sdk2py_bridge import ElasticBand, UnitreeSdk2Bridge
 from gear_sonic.utils.mujoco_sim.robot import Robot
@@ -66,6 +68,22 @@ class DefaultEnv:
         self.onscreen = onscreen
 
         self.init_scene()
+        self.simulation_telemetry_server = None
+        self.valve_qpos_address = None
+        self.valve_dof_address = None
+        valve_joint_id = mujoco.mj_name2id(
+            self.mj_model, mujoco.mjtObj.mjOBJ_JOINT, "object_valve_spin_joint"
+        )
+        if valve_joint_id >= 0:
+            self.valve_qpos_address = int(self.mj_model.jnt_qposadr[valve_joint_id])
+            self.valve_dof_address = int(self.mj_model.jnt_dofadr[valve_joint_id])
+        if self.config.get("ENABLE_SIMULATION_TELEMETRY", False):
+            if self.valve_qpos_address is None:
+                raise ValueError("Simulation telemetry requires object_valve_spin_joint")
+            self.simulation_telemetry_server = SensorServer()
+            self.simulation_telemetry_server.start_server(
+                int(self.config.get("SIMULATION_TELEMETRY_PORT", 5558))
+            )
         self.torques = np.zeros(self.mj_model.nu)
         self.last_reward = 0
 
@@ -505,7 +523,39 @@ class DefaultEnv:
             self.mj_data.ctrl = self.torques
         mujoco.mj_step(self.mj_model, self.mj_data)
 
+        if self.simulation_telemetry_server is not None:
+            self.simulation_telemetry_server.send_message(self.build_simulation_telemetry())
+
         self.check_fall()
+
+    def build_simulation_telemetry(self) -> dict:
+        """Build a synchronized snapshot of Inspire and valve simulation state."""
+        if self.config.get("HAND_TYPE", "dex3") != "inspire":
+            raise ValueError("Simulation telemetry requires Inspire hands")
+        if self.valve_qpos_address is None or self.valve_dof_address is None:
+            raise ValueError("Simulation telemetry requires object_valve_spin_joint")
+        if self.unitree_bridge is None:
+            raise RuntimeError("Unitree bridge is not initialized")
+        left_command, right_command = self.unitree_bridge.GetInspireCommand()
+        return build_simulation_telemetry(
+            source_timestamp_ns=time.monotonic_ns(),
+            sim_time=self.mj_data.time,
+            left_position=self._inspire_joint_to_command(
+                self.mj_data.qpos[self.left_hand_qpos_index], self.left_hand_actuator_index
+            ),
+            right_position=self._inspire_joint_to_command(
+                self.mj_data.qpos[self.right_hand_qpos_index], self.right_hand_actuator_index
+            ),
+            left_command_position=left_command,
+            right_command_position=right_command,
+            valve_angle=self.mj_data.qpos[self.valve_qpos_address],
+        )
+
+    def close(self):
+        server = self.simulation_telemetry_server
+        self.simulation_telemetry_server = None
+        if server is not None:
+            server.stop_server()
 
     def _inspire_command_to_ctrl(self, command, actuator_indices):
         ranges = self.mj_model.actuator_ctrlrange[actuator_indices]
@@ -734,6 +784,7 @@ class BaseSimulator:
         if sim_env is None:
             return
         try:
+            sim_env.close()
             if sim_env.image_publish_process is not None:
                 sim_env.image_publish_process.stop()
             if sim_env.viewer is not None:

@@ -32,6 +32,7 @@ import torch
 from torchvision import transforms
 
 from gear_sonic.data.video_writer import VideoWriter
+from gear_sonic.utils.data_collection.episode_metadata import update_episode_metadata_file
 
 disable_progress_bars()
 
@@ -135,6 +136,14 @@ class Gr00tDatasetMetadata(LeRobotDatasetMetadata):
         for key in valid_keys:
             if key not in modality_config:
                 raise ValueError(f"Modality config must contain a '{key}' key")
+
+    def update_episode_metadata(self, episode_index: int, extra: dict) -> None:
+        """Merge project-specific fields into one standard v2.1 episode entry."""
+        update_episode_metadata_file(
+            self.root / "meta" / "episodes.jsonl", episode_index, extra
+        )
+        if episode_index in self.episodes:
+            self.episodes[episode_index].update(extra)
 
 
 # ---------------------------------------------------------------------------
@@ -317,7 +326,11 @@ class Gr00tDataExporter(LeRobotDataset):
         self.episode_buffer = self.create_episode_buffer()
         self.video_writers = self.create_video_writer()
 
-    def save_episode(self, episode_data: dict | None = None) -> None:
+    def save_episode(
+        self,
+        episode_data: dict | None = None,
+        episode_metadata: dict | None = None,
+    ) -> None:
         if not episode_data:
             episode_buffer = self.episode_buffer
 
@@ -360,6 +373,8 @@ class Gr00tDataExporter(LeRobotDataset):
                 episode_buffer[key] = video_paths[key]
 
         self.meta.save_episode(episode_index, episode_length, episode_tasks, ep_stats)
+        if episode_metadata:
+            self.meta.update_episode_metadata(episode_index, episode_metadata)
 
         ep_data_index = get_episode_data_index(self.meta.episodes, [episode_index])
         ep_data_index_np = {k: t.numpy() for k, t in ep_data_index.items()}
@@ -404,12 +419,12 @@ class Gr00tDataExporter(LeRobotDataset):
             video_paths[key] = self.video_writers[key].stop()
         return video_paths
 
-    def save_episode_as_discarded(self) -> None:
+    def save_episode_as_discarded(self, episode_metadata: dict | None = None) -> None:
         """Flag ongoing episode as discarded and save it to disk."""
         self.meta.info["discarded_episode_indices"] = self.meta.info.get(
             "discarded_episode_indices", []
         ) + [self.episode_buffer["episode_index"]]
-        self.save_episode()
+        self.save_episode(episode_metadata=episode_metadata)
 
 
 # ---------------------------------------------------------------------------

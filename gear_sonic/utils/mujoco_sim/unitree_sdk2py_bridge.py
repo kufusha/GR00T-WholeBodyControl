@@ -295,7 +295,13 @@ class UnitreeSdk2Bridge:
             opened = np.ones(self.num_hand_motor, dtype=np.float64)
             return opened, opened.copy()
         with self.left_hand_cmd_lock, self.right_hand_cmd_lock:
-            positions = [command.q for command in self.inspire_cmd.cmds]
+            if len(self.inspire_cmd.cmds) < 2 * self.num_hand_motor:
+                opened = np.ones(self.num_hand_motor, dtype=np.float64)
+                return opened, opened.copy()
+            positions = [
+                command.q
+                for command in self.inspire_cmd.cmds[: 2 * self.num_hand_motor]
+            ]
         return split_inspire_command_positions(positions, self.num_hand_motor)
 
     def PublishWirelessController(self):

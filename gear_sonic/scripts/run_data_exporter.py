@@ -21,9 +21,10 @@ Usage (from repo root):
 
 from collections import deque
 from dataclasses import dataclass
-from datetime import datetime
 import json
+import math
 import time
+from typing import Literal
 
 import numpy as np
 from scipy.spatial.transform import Rotation as R
@@ -32,14 +33,17 @@ import zmq
 
 from gear_sonic.data.exporter import Gr00tDataExporter
 from gear_sonic.data.features_sonic_vla import (
+    get_inspire_valve_features,
     get_features_sonic_vla,
     get_g1_robot_model,
     get_modality_config_sonic_vla,
     get_wrist_camera_features,
     get_wrist_camera_modality_config,
 )
+from gear_sonic.camera.sensor_server import SensorClient
 from gear_sonic.camera.composed_camera import ComposedCameraClientSensor
 from gear_sonic.utils.data_collection.episode_state import EpisodeState
+from gear_sonic.utils.data_collection.episode_metadata import build_dataset_name
 from gear_sonic.utils.data_collection.keyboard_subscriber import ZMQKeyboardSubscriber
 from gear_sonic.utils.data_collection.telemetry import Telemetry
 from gear_sonic.utils.data_collection.text_to_speech import TextToSpeech
@@ -47,6 +51,14 @@ from gear_sonic.utils.data_collection.transforms import compute_projected_gravit
 from gear_sonic.utils.data_collection.zmq_state_subscriber import (
     ZMQStateSubscriber,
     poll_robot_config_zmq,
+)
+from gear_sonic.utils.data_collection.valve_episode import (
+    VALVE_MODEL_CONFIG,
+    ValveEpisodeTracker,
+)
+from gear_sonic.utils.mujoco_sim.simulation_telemetry import (
+    DEFAULT_SIMULATION_TELEMETRY_PORT,
+    is_fresh_simulation_telemetry,
 )
 
 # ---------------------------------------------------------------------------
@@ -103,6 +115,17 @@ class SonicDataExporterConfig:
     text_to_speech: bool = True
     """Use text-to-speech voice feedback."""
 
+    inspire_valve: bool = False
+    """Record simulation-only Inspire and valve telemetry."""
+
+    simulation_telemetry_host: str = "localhost"
+    simulation_telemetry_port: int = DEFAULT_SIMULATION_TELEMETRY_PORT
+    simulation_telemetry_max_age_sec: float | None = None
+    valve_hand_mode: Literal["two_hand", "left_only", "right_only"] = "two_hand"
+    valve_orientation: Literal["vertical", "horizontal"] = "vertical"
+    valve_target_angle_deg: float | None = None
+    valve_tolerance_deg: float | None = None
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -115,6 +138,38 @@ class TimeDeltaException(Exception):
         self.reset_timeout_sec = reset_timeout_sec
         self.message = f"{self.failure_count} failures in {self.reset_timeout_sec} seconds"
         super().__init__(self.message)
+
+
+def validate_inspire_valve_config(config: SonicDataExporterConfig) -> None:
+    if config.data_collection_frequency <= 0:
+        raise ValueError("data collection frequency must be positive")
+    if not config.inspire_valve:
+        return
+    if config.valve_target_angle_deg is None or not math.isfinite(
+        config.valve_target_angle_deg
+    ):
+        raise ValueError("--inspire-valve requires a finite target angle")
+    if config.valve_tolerance_deg is None or not math.isfinite(
+        config.valve_tolerance_deg
+    ) or config.valve_tolerance_deg <= 0:
+        raise ValueError("--inspire-valve requires a positive finite tolerance")
+    if config.valve_orientation not in {"vertical", "horizontal"}:
+        raise ValueError("Invalid --valve-orientation")
+    if (
+        config.simulation_telemetry_max_age_sec is not None
+        and (
+            not math.isfinite(config.simulation_telemetry_max_age_sec)
+            or config.simulation_telemetry_max_age_sec <= 0
+        )
+    ):
+        raise ValueError("simulation telemetry max age must be positive and finite")
+
+
+def resolve_simulation_telemetry_max_age_ns(config: SonicDataExporterConfig) -> int:
+    seconds = config.simulation_telemetry_max_age_sec
+    if seconds is None:
+        seconds = 2.5 / config.data_collection_frequency
+    return int(seconds * 1e9)
 
 
 def unpack_pose_message(packed_data: bytes, topic: str = "pose") -> dict:
@@ -227,12 +282,36 @@ class GrootDataCollector:
         sonic_data_zmq_port: int = 5556,
         state_zmq_host: str = "localhost",
         state_zmq_port: int = 5557,
+        inspire_valve: bool = False,
+        simulation_telemetry_host: str = "localhost",
+        simulation_telemetry_port: int = DEFAULT_SIMULATION_TELEMETRY_PORT,
+        simulation_telemetry_max_age_ns: int = 50_000_000,
+        valve_hand_mode: str = "two_hand",
+        valve_orientation: str = "vertical",
+        valve_target_angle_rad: float | None = None,
+        valve_tolerance_rad: float | None = None,
     ):
         self.text_to_speech = text_to_speech
         self.frequency = frequency
         self.loop_period = 1.0 / frequency
         self.data_exporter = data_exporter
         self.robot_model = robot_model
+        self.inspire_valve = inspire_valve
+        self._clock_ns = time.monotonic_ns
+        self._simulation_telemetry_max_age_ns = simulation_telemetry_max_age_ns
+        self._simulation_telemetry_client = None
+        self._valve_episode_tracker = None
+        self._valve_tracker_args = (
+            valve_target_angle_rad,
+            valve_tolerance_rad,
+            valve_hand_mode,
+            valve_orientation,
+        )
+        if inspire_valve:
+            self._simulation_telemetry_client = SensorClient()
+            self._simulation_telemetry_client.start_client(
+                simulation_telemetry_host, simulation_telemetry_port
+            )
 
         self._episode_state = EpisodeState()
         self._keyboard_listener = ZMQKeyboardSubscriber()
@@ -320,6 +399,10 @@ class GrootDataCollector:
             self._episode_state.change_state()
             if self._episode_state.get_state() == self._episode_state.RECORDING:
                 self._initial_yaw = None
+                if self.inspire_valve:
+                    self._valve_episode_tracker = ValveEpisodeTracker(
+                        *self._valve_tracker_args
+                    )
                 self._print_and_say(
                     f"Started recording {self.current_episode_index}", blocking=False
                 )
@@ -329,7 +412,14 @@ class GrootDataCollector:
                 self._print_and_say("Saved episode and back to idle state", blocking=False)
         elif key == "x":
             if self._episode_state.get_state() == self._episode_state.RECORDING:
-                self.data_exporter.save_episode_as_discarded()
+                buffer_size = self.data_exporter.episode_buffer.get("size", 0)
+                metadata = self._finish_valve_episode(False, True)
+                if buffer_size > 0:
+                    self.data_exporter.save_episode_as_discarded(
+                        episode_metadata=metadata
+                    )
+                else:
+                    self.data_exporter.skip_and_start_new_episode()
                 self._episode_state.reset_state()
                 self._initial_yaw = None
                 self._print_and_say("Discarded episode", blocking=False)
@@ -545,7 +635,8 @@ class GrootDataCollector:
         if self._episode_state.get_state() == self._episode_state.NEED_TO_SAVE:
             buffer_size = self.data_exporter.episode_buffer.get("size", 0)
             if buffer_size > 0:
-                self.data_exporter.save_episode()
+                metadata = self._finish_valve_episode(True, False)
+                self.data_exporter.save_episode(episode_metadata=metadata)
                 self.sonic_timing_monitor.reset()
                 self._initial_yaw = None
                 self._print_and_say("Finished saving episode")
@@ -610,10 +701,63 @@ class GrootDataCollector:
 
         self._add_images_to_frame_data(frame_data)
 
+        if self.inspire_valve and not self._add_inspire_valve_features(frame_data):
+            return False
+
         self._log_latency_periodic(sonic_latency_ms)
 
         self.data_exporter.add_frame(frame_data)
         return self._finalize_frame(t_start)
+
+    def _add_inspire_valve_features(self, frame_data: dict) -> bool:
+        message = self._simulation_telemetry_client.receive_message_nonblocking()
+        tracker = self._valve_episode_tracker
+        if message is None:
+            tracker.record_drop("missing")
+            return False
+        now_ns = self._clock_ns()
+        if not is_fresh_simulation_telemetry(
+            message, now_ns, self._simulation_telemetry_max_age_ns
+        ):
+            tracker.record_drop("stale")
+            return False
+        try:
+            vector_keys = ("inspire_position", "action_inspire_position")
+            arrays = {
+                key: np.asarray(message[key], dtype=np.float32).reshape(-1)
+                for key in vector_keys
+            }
+            if any(value.shape != (12,) for value in arrays.values()):
+                raise ValueError("Inspire telemetry vectors must have shape (12,)")
+            scalars = {"valve_angle": float(message["valve_angle"])}
+            if not all(np.all(np.isfinite(value)) for value in arrays.values()) or not all(
+                math.isfinite(value) for value in scalars.values()
+            ):
+                raise ValueError("Simulation telemetry contains non-finite values")
+        except (KeyError, TypeError, ValueError):
+            tracker.record_drop("invalid_shape")
+            return False
+
+        timestamp = int(message["source_timestamp_ns"])
+        if not tracker.started:
+            tracker.start(scalars["valve_angle"], timestamp)
+        else:
+            tracker.update(scalars["valve_angle"], timestamp)
+        tracker.record_sample(timestamp, now_ns - timestamp)
+        frame_data.update({
+            "observation.inspire.position": arrays["inspire_position"],
+            "action.inspire.position": arrays["action_inspire_position"],
+            "observation.sim.valve_angle": np.array([tracker.current_angle], dtype=np.float32),
+        })
+        return True
+
+    def _finish_valve_episode(self, manual_completed: bool, discarded: bool):
+        tracker = self._valve_episode_tracker
+        self._valve_episode_tracker = None
+        if not self.inspire_valve or tracker is None or not tracker.started:
+            return None
+        metadata = tracker.finish(manual_completed, discarded)
+        return metadata
 
     def _add_cpp_state_features(self, frame_data: dict, proprio: dict) -> None:
         if "base_quat" in proprio:
@@ -833,7 +977,13 @@ class GrootDataCollector:
             self._print_and_say("saving episode done", blocking=False)
             buffer_size = self.data_exporter.episode_buffer.get("size", 0)
             if buffer_size > 0:
-                self.data_exporter.save_episode()
+                metadata = self._finish_valve_episode(False, True)
+                if self.inspire_valve:
+                    self.data_exporter.save_episode_as_discarded(
+                        episode_metadata=metadata
+                    )
+                else:
+                    self.data_exporter.save_episode()
             self._print_and_say(
                 f"Recording complete: {self.data_exporter.meta.root}", say=False, blocking=True
             )
@@ -844,6 +994,11 @@ class GrootDataCollector:
             self._state_subscriber.close()
         except Exception:
             pass
+        if self._simulation_telemetry_client is not None:
+            try:
+                self._simulation_telemetry_client.stop_client()
+            except Exception:
+                pass
         for sock in [self._sonic_zmq_socket]:
             if sock is not None:
                 try:
@@ -897,7 +1052,8 @@ class GrootDataCollector:
             print("Data exporter terminated by user")
             buffer_size = self.data_exporter.episode_buffer.get("size", 0)
             if buffer_size > 0:
-                self.data_exporter.save_episode_as_discarded()
+                metadata = self._finish_valve_episode(False, True)
+                self.data_exporter.save_episode_as_discarded(episode_metadata=metadata)
 
         finally:
             self.save_and_cleanup()
@@ -909,10 +1065,14 @@ class GrootDataCollector:
 
 
 def main(config: SonicDataExporterConfig):
+    validate_inspire_valve_config(config)
     g1_rm = get_g1_robot_model()
 
     dataset_features = get_features_sonic_vla(g1_rm)
     modality_config = get_modality_config_sonic_vla(g1_rm)
+
+    if config.inspire_valve:
+        dataset_features.update(get_inspire_valve_features())
 
     if config.record_wrist_cameras:
         print("[Camera] Wrist cameras enabled — adding to dataset schema")
@@ -930,13 +1090,29 @@ def main(config: SonicDataExporterConfig):
         config.state_zmq_host, config.state_zmq_port, config.robot_config_timeout
     )
 
+    script_config = {
+        **robot_config,
+        "record_wrist_cameras": config.record_wrist_cameras,
+    }
+    if config.inspire_valve:
+        script_config["valve_collection"] = {
+            "source": "mujoco",
+            "hand_type": "inspire_rh56dfx",
+            "hand_mode": config.valve_hand_mode,
+            "valve_orientation": config.valve_orientation,
+            "target_angle_rad": math.radians(config.valve_target_angle_deg),
+            "tolerance_rad": math.radians(config.valve_tolerance_deg),
+            "simulation_telemetry_port": config.simulation_telemetry_port,
+            "valve_model": VALVE_MODEL_CONFIG,
+        }
+
     data_exporter = Gr00tDataExporter.create(
         save_root=f"{config.root_output_dir}/{config.dataset_name}",
         fps=config.data_collection_frequency,
         features=dataset_features,
         modality_config=modality_config,
         task=config.task_prompt,
-        script_config={**robot_config, "record_wrist_cameras": config.record_wrist_cameras},
+        script_config=script_config,
     )
 
     data_collector = GrootDataCollector(
@@ -950,6 +1126,18 @@ def main(config: SonicDataExporterConfig):
         sonic_data_zmq_port=config.sonic_zmq_port,
         state_zmq_host=config.state_zmq_host,
         state_zmq_port=config.state_zmq_port,
+        inspire_valve=config.inspire_valve,
+        simulation_telemetry_host=config.simulation_telemetry_host,
+        simulation_telemetry_port=config.simulation_telemetry_port,
+        simulation_telemetry_max_age_ns=resolve_simulation_telemetry_max_age_ns(config),
+        valve_hand_mode=config.valve_hand_mode,
+        valve_orientation=config.valve_orientation,
+        valve_target_angle_rad=(
+            math.radians(config.valve_target_angle_deg) if config.inspire_valve else None
+        ),
+        valve_tolerance_rad=(
+            math.radians(config.valve_tolerance_deg) if config.inspire_valve else None
+        ),
     )
     data_collector.run()
 
@@ -958,6 +1146,6 @@ if __name__ == "__main__":
     config = tyro.cli(SonicDataExporterConfig)
 
     if config.dataset_name is None:
-        config.dataset_name = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
+        config.dataset_name = build_dataset_name(config.task_prompt)
 
     main(config)
