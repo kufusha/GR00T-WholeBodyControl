@@ -75,12 +75,11 @@ Keep every existing entry and field. After the installed `PICO4U` and `ZEDMINI` 
       value: 1000000
 ```
 
-Check the names and parse the merged YAML locally before pushing it. The Python command requires PyYAML, available in `.venv_data_collection`:
+Check the names and parse the merged YAML locally before pushing it. The Python command requires PyYAML, declared by the simulation extra and available in `.venv_sim`:
 
 ```bash
 grep '^- name:' ./video_source.yml.merged
-source .venv_data_collection/bin/activate
-python -c 'import sys, yaml; data = yaml.safe_load(open(sys.argv[1])); assert isinstance(data, list); names = [item["name"] for item in data]; assert all(names.count(name) == 1 for name in ("PICO4U", "ZEDMINI", "MUJOCO")); assert names.index("MUJOCO") > max(names.index("PICO4U"), names.index("ZEDMINI")); print(names)' ./video_source.yml.merged
+.venv_sim/bin/python -c 'import sys, yaml; data = yaml.safe_load(open(sys.argv[1])); assert isinstance(data, list); names = [item["name"] for item in data]; assert all(names.count(name) == 1 for name in ("PICO4U", "ZEDMINI", "MUJOCO")); assert names.index("MUJOCO") > max(names.index("PICO4U"), names.index("ZEDMINI")); print(names)' ./video_source.yml.merged
 ```
 
 The printed list must include the original sources exactly once and `MUJOCO` exactly once, after both original entries. Review the complete merged file before installation.
