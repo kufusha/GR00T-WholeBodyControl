@@ -670,6 +670,80 @@ def test_main_handles_interrupt_and_closes_bridge_resources(monkeypatch, caplog)
     assert any("Stopping XRoboToolkit ego stream" in r.message for r in caplog.records)
 
 
+def install_failing_control_resources(monkeypatch, failure_phase):
+    real_thread = threading.Thread
+    threads = []
+
+    def wait_for_control_failure():
+        assert subscriber.stop.wait(1.0), "Control failure did not stop the video loop"
+
+    subscriber = BridgeSubscriber([wait_for_control_failure], FakeStopEvent())
+    context = BridgeContext(subscriber)
+    client = ScriptedClient([], PicoTargetStore())
+    listener = ScriptedListener([client], subscriber.stop)
+
+    def fail_bind(endpoint):
+        raise OSError("address in use")
+
+    if failure_phase == "bind":
+        listener.bind = fail_bind
+
+    class FailingWorker:
+        def __init__(self):
+            if failure_phase == "construct":
+                raise RuntimeError("thread limit reached")
+
+        def start(self):
+            raise RuntimeError("thread limit reached")
+
+        def join(self, timeout):
+            raise AssertionError("An unstarted worker must never be joined")
+
+    def make_thread(**kwargs):
+        if kwargs["name"] == "xrobotoolkit-control-client":
+            return FailingWorker()
+        subscriber.stop = kwargs["args"][2]
+        listener.stop_event = subscriber.stop
+        thread = real_thread(**kwargs)
+        threads.append(thread)
+        return thread
+
+    monkeypatch.setattr(threading, "Thread", make_thread)
+    monkeypatch.setattr(socket, "socket", lambda *args: listener)
+    monkeypatch.setattr(zmq, "Context", lambda: context)
+    return subscriber, context, listener, client, threads
+
+
+@pytest.mark.parametrize("failure_phase", ["bind", "construct", "start"])
+def test_run_bridge_propagates_control_failure_after_resource_cleanup(monkeypatch, failure_phase):
+    subscriber, context, listener, client, threads = install_failing_control_resources(
+        monkeypatch, failure_phase
+    )
+
+    with pytest.raises(RuntimeError, match="Control server failed"):
+        run_bridge(parse_args([]))
+
+    assert subscriber.closed and context.terminated and listener.closed
+    assert subscriber.stop.is_set() and not threads[0].is_alive()
+    if failure_phase != "bind":
+        assert client.closed
+
+
+@pytest.mark.parametrize("failure_phase", ["bind", "construct", "start"])
+def test_main_returns_failure_status_after_control_failure_cleanup(monkeypatch, failure_phase):
+    subscriber, context, listener, client, threads = install_failing_control_resources(
+        monkeypatch, failure_phase
+    )
+
+    status = main([])
+
+    assert subscriber.closed and context.terminated and listener.closed
+    assert subscriber.stop.is_set() and not threads[0].is_alive()
+    if failure_phase != "bind":
+        assert client.closed
+    assert status != 0
+
+
 @pytest.mark.parametrize("payload", [[], 7, {"images": []}, {"images": {"ego_view": b""}}])
 def test_decode_camera_frame_wraps_malformed_camera_payload(payload):
     with pytest.raises(CameraFrameError):
@@ -821,3 +895,27 @@ def test_cli_defaults_match_mujoco_profile():
 def test_cli_rejects_non_positive_numbers(flag, value):
     with pytest.raises(SystemExit):
         parse_args([flag, value])
+
+
+@pytest.mark.parametrize("flag", ["--camera-port", "--command-port", "--pico-camera-port"])
+@pytest.mark.parametrize("value", ["1", "65535"])
+def test_cli_accepts_tcp_port_boundaries(flag, value):
+    config = parse_args([flag, value])
+
+    assert getattr(config, flag[2:].replace("-", "_")) == int(value)
+
+
+@pytest.mark.parametrize("flag", ["--camera-port", "--command-port", "--pico-camera-port"])
+@pytest.mark.parametrize("value", ["0", "65536"])
+def test_cli_rejects_out_of_range_tcp_ports(flag, value):
+    with pytest.raises(SystemExit) as error:
+        parse_args([flag, value])
+
+    assert error.value.code == 2
+
+
+@pytest.mark.parametrize("flag", ["--fps", "--bitrate"])
+def test_cli_positive_stream_settings_are_not_limited_to_tcp_port_range(flag):
+    config = parse_args([flag, "65536"])
+
+    assert getattr(config, flag[2:]) == 65536

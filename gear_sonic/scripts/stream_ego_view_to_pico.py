@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from fractions import Fraction
 import ipaddress
 import logging
+import queue
 import re
 import socket
 import struct
@@ -35,6 +36,10 @@ STEREO_HEIGHT = EYE_HEIGHT
 MAX_CONTROL_MESSAGE_BYTES = 4096
 MAX_CONTROL_CLIENTS = 8
 LOGGER = logging.getLogger(__name__)
+
+
+class ControlServerError(RuntimeError):
+    """Raised after bridge shutdown when the control server fails."""
 
 
 class PicoTargetStore:
@@ -81,15 +86,23 @@ def positive_int(value: str) -> int:
     return parsed
 
 
+def tcp_port(value: str) -> int:
+    """Parse a command-line TCP port in the inclusive range 1 through 65535."""
+    parsed = int(value)
+    if not 1 <= parsed <= 65535:
+        raise argparse.ArgumentTypeError("TCP port must be between 1 and 65535")
+    return parsed
+
+
 def parse_args(argv: Sequence[str] | None = None) -> PicoStreamConfig:
     """Parse bridge arguments without changing the data-collection launcher."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--camera-host", default="localhost")
-    parser.add_argument("--camera-port", type=positive_int, default=5555)
+    parser.add_argument("--camera-port", type=tcp_port, default=5555)
     parser.add_argument("--camera-key", default="ego_view")
     parser.add_argument("--command-host", default="0.0.0.0")
-    parser.add_argument("--command-port", type=positive_int, default=13579)
-    parser.add_argument("--pico-camera-port", type=positive_int, default=12345)
+    parser.add_argument("--command-port", type=tcp_port, default=13579)
+    parser.add_argument("--pico-camera-port", type=tcp_port, default=12345)
     parser.add_argument("--fps", type=positive_int, default=30)
     parser.add_argument("--bitrate", type=positive_int, default=1_000_000)
     return PicoStreamConfig(**vars(parser.parse_args(argv)))
@@ -233,7 +246,10 @@ def _handle_control_client(
 
 
 def run_control_server(
-    config: PicoStreamConfig, targets: PicoTargetStore, stop_event: threading.Event
+    config: PicoStreamConfig,
+    targets: PicoTargetStore,
+    stop_event: threading.Event,
+    errors: queue.SimpleQueue[Exception] | None = None,
 ) -> None:
     """Serve bounded XRoboToolkit requests until shutdown."""
     clients = []
@@ -273,6 +289,8 @@ def run_control_server(
                 clients.append(worker)
     except (OSError, RuntimeError) as error:
         LOGGER.error("Control server failed: %s", error)
+        if errors is not None:
+            errors.put(error)
         stop_event.set()
     finally:
         for worker in clients:
@@ -356,9 +374,10 @@ def run_bridge(config: PicoStreamConfig) -> None:
     """Own the control thread and latest-frame camera subscriber."""
     stop_event = threading.Event()
     targets = PicoTargetStore()
+    control_errors: queue.SimpleQueue[Exception] = queue.SimpleQueue()
     control_thread = threading.Thread(
         target=run_control_server,
-        args=(config, targets, stop_event),
+        args=(config, targets, stop_event, control_errors),
         name="xrobotoolkit-control",
         daemon=True,
     )
@@ -382,6 +401,11 @@ def run_bridge(config: PicoStreamConfig) -> None:
         if context is not None:
             context.term()
         control_thread.join(timeout=2.0)
+    try:
+        error = control_errors.get_nowait()
+    except queue.Empty:
+        return
+    raise ControlServerError(f"Control server failed: {error}") from error
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -391,6 +415,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         run_bridge(config)
     except KeyboardInterrupt:
         LOGGER.info("Stopping XRoboToolkit ego stream")
+    except ControlServerError:
+        return 1
     return 0
 
 
