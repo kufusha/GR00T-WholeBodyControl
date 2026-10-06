@@ -112,6 +112,9 @@ class ScriptedClient(FakeSocket):
         return self
 
     def __exit__(self, *args):
+        self.close()
+
+    def close(self):
         self.closed = True
         self.closed_event.set()
 
@@ -216,39 +219,41 @@ def test_control_server_clears_target_on_connection_error(monkeypatch):
     assert client.closed and listener.closed
 
 
-def test_control_server_replaces_live_client_and_preserves_target_on_stale_disconnect(monkeypatch):
-    targets = PicoTargetStore()
-    stop = threading.Event()
+class LiveClient(ScriptedClient):
+    def __init__(self, host, targets):
+        super().__init__([f"OPEN_CAMERA {host}".encode(), socket.timeout()], targets)
+        self.incoming = queue.Queue()
+        self.registered = threading.Event()
 
-    class LiveClient(ScriptedClient):
-        def __init__(self, host):
-            super().__init__([f"OPEN_CAMERA {host}".encode(), socket.timeout()], targets)
-            self.incoming = queue.Queue()
-            self.registered = threading.Event()
-
-        def recv(self, size):
+    def recv(self, size):
+        try:
+            return super().recv(size)
+        except StopIteration:
+            self.registered.set()
             try:
-                return super().recv(size)
-            except StopIteration:
-                self.registered.set()
-                try:
-                    return self.incoming.get(timeout=self.timeout)
-                except queue.Empty:
-                    raise socket.timeout from None
-
-    class LiveListener(ScriptedListener):
-        def __init__(self):
-            super().__init__([], stop)
-            self.incoming = queue.Queue()
-
-        def accept(self):
-            try:
-                return self.incoming.get(timeout=0.1), ("192.168.0.77", 50000)
+                return self.incoming.get(timeout=self.timeout)
             except queue.Empty:
                 raise socket.timeout from None
 
-    first, second = LiveClient("192.168.0.10"), LiveClient("192.168.0.11")
-    listener = LiveListener()
+
+class LiveListener(ScriptedListener):
+    def __init__(self, stop):
+        super().__init__([], stop)
+        self.incoming = queue.Queue()
+
+    def accept(self):
+        try:
+            return self.incoming.get(timeout=0.1), ("192.168.0.77", 50000)
+        except queue.Empty:
+            raise socket.timeout from None
+
+
+def test_control_server_replaces_live_client_and_preserves_target_on_stale_disconnect(monkeypatch):
+    targets = PicoTargetStore()
+    stop = threading.Event()
+    first = LiveClient("192.168.0.10", targets)
+    second = LiveClient("192.168.0.11", targets)
+    listener = LiveListener(stop)
     listener.incoming.put(first)
     monkeypatch.setattr(socket, "socket", lambda *args: listener)
     server = threading.Thread(target=run_control_server, args=(parse_args([]), targets, stop))
@@ -275,6 +280,82 @@ def test_control_server_replaces_live_client_and_preserves_target_on_stale_disco
         second.incoming.put(b"")
         server.join(timeout=2.0)
     assert not server.is_alive() and listener.closed
+
+
+def test_control_server_bounds_live_workers_and_closes_overflow_client(monkeypatch, caplog):
+    targets = PicoTargetStore()
+    stop = threading.Event()
+    clients = [LiveClient(f"192.168.0.{index}", targets) for index in range(1, 11)]
+    listener = LiveListener(stop)
+    monkeypatch.setattr(socket, "socket", lambda *args: listener)
+    server = threading.Thread(target=run_control_server, args=(parse_args([]), targets, stop))
+    real_thread = threading.Thread
+    workers = []
+
+    def record_worker(**kwargs):
+        worker = real_thread(**kwargs)
+        workers.append(worker)
+        return worker
+
+    monkeypatch.setattr(threading, "Thread", record_worker)
+    server.start()
+    try:
+        for client in clients[:8]:
+            listener.incoming.put(client)
+            assert client.registered.wait(1.0)
+
+        listener.incoming.put(clients[8])
+        assert clients[8].closed_event.wait(1.0), "Overflow client retained an unbounded worker"
+        assert not clients[8].registered.is_set()
+        assert targets.snapshot() == ("192.168.0.8", 8)
+        assert not stop.is_set() and server.is_alive()
+
+        clients[0].incoming.put(b"")
+        assert clients[0].closed_event.wait(1.0)
+        workers[0].join(timeout=1.0)
+        assert not workers[0].is_alive()
+        listener.incoming.put(clients[9])
+        assert clients[9].registered.wait(1.0)
+        assert targets.snapshot() == ("192.168.0.10", 9)
+    finally:
+        stop.set()
+        server.join(timeout=2.0)
+    assert not server.is_alive() and listener.closed
+    assert all(client.closed for client in clients)
+    assert targets.snapshot() == (None, 9)
+    assert any("Too many control clients" in r.message for r in caplog.records)
+
+
+@pytest.mark.parametrize("failure_phase", ["construct", "start"])
+def test_control_server_stops_and_closes_unowned_client_on_thread_failure(
+    monkeypatch, caplog, failure_phase
+):
+    targets = PicoTargetStore()
+    stop = threading.Event()
+    client = ScriptedClient([], targets)
+    listener = ScriptedListener([client], stop)
+
+    class FailingThread:
+        def __init__(self, **kwargs):
+            if failure_phase == "construct":
+                raise RuntimeError("thread limit reached")
+
+        def start(self):
+            raise RuntimeError("thread limit reached")
+
+        def join(self, timeout):
+            raise AssertionError("An unstarted worker must never be joined")
+
+    monkeypatch.setattr(socket, "socket", lambda *args: listener)
+    monkeypatch.setattr(threading, "Thread", FailingThread)
+
+    run_control_server(parse_args([]), targets, stop)
+
+    assert stop.is_set() and listener.closed and client.closed
+    assert targets.snapshot() == (None, 0)
+    assert any(
+        "thread limit reached" in r.message and r.levelname == "ERROR" for r in caplog.records
+    )
 
 
 class FakeStopEvent(threading.Event):

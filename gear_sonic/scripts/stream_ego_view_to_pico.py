@@ -33,6 +33,7 @@ EYE_HEIGHT = 480
 STEREO_WIDTH = EYE_WIDTH * 2
 STEREO_HEIGHT = EYE_HEIGHT
 MAX_CONTROL_MESSAGE_BYTES = 4096
+MAX_CONTROL_CLIENTS = 8
 LOGGER = logging.getLogger(__name__)
 
 
@@ -254,15 +255,23 @@ def run_control_server(
                 except socket.timeout:
                     continue
                 clients = [worker for worker in clients if worker.is_alive()]
-                worker = threading.Thread(
-                    target=serve_client,
-                    args=(client, address[0]),
-                    name="xrobotoolkit-control-client",
-                    daemon=True,
-                )
+                if len(clients) >= MAX_CONTROL_CLIENTS:
+                    client.close()
+                    LOGGER.warning("Too many control clients; rejecting %s", address[0])
+                    continue
+                try:
+                    worker = threading.Thread(
+                        target=serve_client,
+                        args=(client, address[0]),
+                        name="xrobotoolkit-control-client",
+                        daemon=True,
+                    )
+                    worker.start()
+                except (OSError, RuntimeError):
+                    client.close()
+                    raise
                 clients.append(worker)
-                worker.start()
-    except OSError as error:
+    except (OSError, RuntimeError) as error:
         LOGGER.error("Control server failed: %s", error)
         stop_event.set()
     finally:
