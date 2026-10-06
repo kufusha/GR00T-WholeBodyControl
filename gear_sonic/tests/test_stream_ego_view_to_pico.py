@@ -1,4 +1,5 @@
 from fractions import Fraction
+from pathlib import Path
 import queue
 import socket
 import threading
@@ -9,6 +10,7 @@ import msgpack
 import msgpack_numpy
 import numpy as np
 import pytest
+import yaml
 import zmq
 
 from gear_sonic.camera.sensor_server import ImageMessageSchema
@@ -29,6 +31,22 @@ from gear_sonic.scripts.stream_ego_view_to_pico import (
     run_video_loop,
     send_h264_packets,
 )
+
+
+def test_mujoco_profile_matches_bridge_video_contract():
+    profile_path = Path(__file__).parents[1] / "config" / "xrobotoolkit" / "mujoco_video_source.yml"
+    profiles = yaml.safe_load(profile_path.read_text(encoding="utf-8"))
+
+    assert len(profiles) == 1
+    profile = profiles[0]
+    properties = {item["name"]: item["value"] for item in profile["properties"]}
+    assert profile["name"] == "MUJOCO"
+    assert profile["camera"] == "ZED"
+    assert properties["CamWidth"] == 1280
+    assert properties["CamHeight"] == 480
+    assert properties["CamFPS"] == 30
+    assert properties["CamBitrate"] == 1_000_000
+    assert properties["heightCompressionFactor"] == pytest.approx(4 / 3)
 
 
 def test_pico_target_store_replaces_target_and_ignores_stale_disconnect():

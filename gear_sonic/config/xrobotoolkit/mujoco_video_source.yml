@@ -1,0 +1,37 @@
+# Merge this entry into XRoboToolkit's installed video_source.yml.
+- name: "MUJOCO"
+  camera: "ZED"
+  description: "MuJoCo ego view from GR00T WholeBodyControl"
+  properties:
+    - name: "visibleRatio"
+      type: "float"
+      description: "Visible ratio for the shader"
+      value: 0.555
+    - name: "contentRatio"
+      type: "float"
+      description: "Content ratio for the shader"
+      value: 1.8
+    - name: "heightCompressionFactor"
+      type: "float"
+      description: "Height compression factor for the shader"
+      value: 1.333333
+    - name: "RawImageRectSize"
+      type: "string"
+      description: "Size of the RawImage rectangle for the stereo view"
+      value: "600x225"
+    - name: "CamWidth"
+      type: "int"
+      description: "Combined side-by-side frame width"
+      value: 1280
+    - name: "CamHeight"
+      type: "int"
+      description: "Combined side-by-side frame height"
+      value: 480
+    - name: "CamFPS"
+      type: "int"
+      description: "Video frame rate"
+      value: 30
+    - name: "CamBitrate"
+      type: "int"
+      description: "Video bitrate in bits per second"
+      value: 1000000
