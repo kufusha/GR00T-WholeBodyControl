@@ -447,6 +447,90 @@ recorded in this mode.
 Keyboard commands are sent via a separate ZMQ publisher (default port `5580`). The data exporter subscribes to this channel automatically. You can send keys from any ZMQ publisher on that port, or integrate with the C++ deployment's keyboard handler.
 ```
 
+### View the MuJoCo Ego Camera in XRoboToolkit
+
+An optional bridge displays the MuJoCo `ego_view` camera in XRoboToolkit
+Remote Vision on PICO. It only forwards video; recording, the camera viewer,
+PICO pose input, and episode controls continue to use the existing data
+collection paths.
+
+First install the `MUJOCO` video profile by following
+`gear_sonic/config/xrobotoolkit/README.md`. ADB is required for profile
+installation, but it is not required while streaming over Wi-Fi.
+
+Start the simulation data-collection workflow described above. For a generic
+MuJoCo session, the minimal launcher command is:
+
+```bash
+python gear_sonic/scripts/launch_data_collection.py --sim
+```
+
+For an Inspire valve session, use the full `--inspire-valve` launcher command
+from the previous section. The launcher uses `.venv_sim` for MuJoCo and
+`.venv_data_collection` for the data exporter and camera viewer.
+
+In a separate terminal, run the XRoboToolkit video bridge from the data
+collection environment:
+
+```bash
+cd /path/to/GR00T-WholeBodyControl
+source .venv_data_collection/bin/activate
+python gear_sonic/scripts/stream_ego_view_to_pico.py
+```
+
+On PICO, select `MUJOCO`, press **Listen** once, and enter the workstation's
+LAN IP address. Do not enter `0.0.0.0`; it is the bridge's listen address, not
+the workstation address. Streaming starts when MuJoCo publishes `ego_view`,
+the bridge receives the PICO request, and the headset opens its video listener.
+
+The default connections are:
+
+| Connection | Direction | Default |
+|---|---|---|
+| MuJoCo camera ZMQ (`ego_view`) | Bridge subscribes on the workstation | `tcp://localhost:5555` |
+| Remote Vision control TCP | PICO connects to the bridge | Workstation port `13579` |
+| H.264 video TCP | Bridge connects to PICO | PICO port `12345` |
+
+The workstation and PICO must be on the same LAN. If a firewall is enabled,
+allow inbound TCP port `13579` from the PICO and outbound TCP port `12345` to
+the PICO. Camera ZMQ remains local to the workstation by default.
+
+The bridge initially logs:
+
+```text
+Camera endpoint: tcp://localhost:5555 (ego_view)
+Control listening on 0.0.0.0:13579
+```
+
+After PICO requests the stream and the first camera frame is available, it
+logs:
+
+```text
+PICO target: <PICO_IP>
+Video connected to <PICO_IP>:12345
+```
+
+Use the following checks when video does not appear:
+
+- If `PICO target` is missing, confirm the workstation IP entered on PICO and
+  check TCP port `13579`.
+- If the bridge repeatedly reports `Connection refused`, the PICO video
+  listener is not active on port `12345`. Fully restart XRoboToolkit, select
+  `MUJOCO`, and press **Listen** once. Reboot the headset if its previous video
+  listener did not terminate cleanly.
+- If `PICO target` appears but `Video connected` does not, confirm the
+  simulation camera viewer receives `ego_view` from port `5555`.
+- If the local camera viewer is correct but PICO remains blank, inspect the
+  PICO decoder logs and confirm the profile remains `1280x480` at 30 FPS.
+- If pose works but video does not, debug the paths independently. This bridge
+  does not replace `pico_manager_thread_server.py`.
+
+The bridge duplicates the single 640x480 MuJoCo image for both eyes in a
+1280x480 side-by-side frame. It does not provide stereo depth or a head-coupled
+camera. Stop it with `Ctrl+C`. Run
+`python gear_sonic/scripts/stream_ego_view_to_pico.py --help` for endpoint,
+port, FPS, and bitrate overrides.
+
 ---
 
 ## Camera Viewer

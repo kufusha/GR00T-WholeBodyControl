@@ -1,17 +1,15 @@
-# XRoboToolkit MuJoCo Ego View
+# XRoboToolkit MUJOCO Video Profile
 
-## What this changes
+## What this configures
 
-This adds an optional, standalone display path from the MuJoCo `ego_view` camera to XRoboToolkit Remote Vision on PICO. Recording, the camera viewer, the tmux data-collection launcher, PICO pose input, and episode controls remain unchanged. The bridge only forwards video; it does not replace `pico_manager_thread_server.py`.
+This directory provides the optional `MUJOCO` entry for XRoboToolkit Remote
+Vision's installed `video_source.yml`. The entry configures a 1280x480,
+side-by-side H.264 video source for the MuJoCo ego camera.
 
 ## Requirements
 
 - A PICO headset running a version of XRoboToolkit Remote Vision that supports `video_source.yml`.
 - USB debugging and ADB access to the headset for profile installation.
-- The simulation PC and PICO on the same LAN. Use the PC's LAN IP in Remote Vision.
-- The project's `.venv_data_collection` environment with PyAV and a working `libx264` encoder. If the environment is missing, run `bash install_scripts/install_data_collection.sh` from the repository root.
-
-XRoboToolkit compatibility and the full connection path still require validation on the actual headset.
 
 ## Back up the installed profile
 
@@ -75,7 +73,8 @@ Keep every existing entry and field. After the installed `PICO4U` and `ZEDMINI` 
       value: 1000000
 ```
 
-Check the names and parse the merged YAML locally before pushing it. The Python command requires PyYAML, declared by the simulation extra and available in `.venv_sim`:
+Check the names and parse the merged YAML locally before pushing it. This is
+only a profile syntax check. It uses PyYAML from `.venv_sim`:
 
 ```bash
 grep '^- name:' ./video_source.yml.merged
@@ -93,56 +92,11 @@ adb shell am force-stop com.xrobotoolkit.client
 
 Restart XRoboToolkit on the headset after the force-stop. Alternatively, close and restart the headset application. Open its video-source selection and verify that `MUJOCO` appears alongside the preserved `PICO4U` and `ZEDMINI` sources.
 
-## Run data collection and the bridge
+## Use the installed profile
 
-Terminal 1: start data collection with your existing, user-selected launcher command, unchanged. For the MuJoCo launcher workflow, that command is:
-
-```bash
-python gear_sonic/scripts/launch_data_collection.py --sim
-```
-
-Terminal 2:
-
-```bash
-cd /home/kufushatec/mansub/GR00T-WholeBodyControl
-source .venv_data_collection/bin/activate
-python gear_sonic/scripts/stream_ego_view_to_pico.py
-```
-
-On PICO, select `MUJOCO`, press `Listen`, and enter the simulation PC's LAN IP. The launcher, bridge, and headset listener may be started in any order; streaming begins once all three are ready and the simulation publishes `ego_view`. Stop the bridge with Ctrl-C.
-
-Use `python gear_sonic/scripts/stream_ego_view_to_pico.py --help` to see optional overrides for the camera endpoint, key, control listener, PICO video port, FPS, and bitrate. The defaults match the profile above: 30 FPS and 1000000 bits/s.
-
-## Network contract
-
-| Connection | Direction | Default |
-| --- | --- | --- |
-| MuJoCo camera ZMQ (`ego_view`) | Bridge subscribes on the PC | `tcp://localhost:5555` |
-| Remote Vision control TCP | PICO connects to the bridge on the PC | `0.0.0.0:13579` listener |
-| H.264 video TCP | Bridge connects from the PC to PICO | `PICO_IP:12345` |
-
-`0.0.0.0` is a listen address, not the address to enter on PICO; enter the PC's LAN IP. If the PC firewall blocks these connections, allow inbound TCP 13579 from the PICO and outbound TCP 12345 to it. For example, with UFW and a PICO at `192.168.1.50`:
-
-```bash
-sudo ufw allow from 192.168.1.50 to any port 13579 proto tcp
-sudo ufw allow out to 192.168.1.50 port 12345 proto tcp
-```
-
-Use the actual headset IP and your site's firewall policy. These rules are examples; they are only needed if the firewall blocks the traffic. Camera ZMQ stays on the PC with the default `localhost` setting.
-
-## Expected logs
-
-At startup, expect `Control listening on 0.0.0.0:13579` and `Camera endpoint: tcp://localhost:5555 (ego_view)`. After PICO requests video, expect `PICO target: <PICO_IP>` and, once a camera frame is available and the video socket connects, `Video connected to <PICO_IP>:12345`. On Ctrl-C, expect `Stopping XRoboToolkit ego stream`. The bridge does not print a line for each frame.
-
-## Troubleshooting
-
-- **`adb devices` shows no device:** Check the USB connection and USB mode, enable developer options and USB debugging, accept the headset authorization prompt, then retry `adb kill-server && adb start-server` and `adb devices`.
-- **`MUJOCO` is missing:** Parse and inspect the merged YAML, confirm the push went to `/sdcard/Android/data/com.xrobotoolkit.client/files/video_source.yml`, and restart the headset application.
-- **Blank image:** Confirm the simulation publishes `ego_view` on camera ZMQ `localhost:5555`; check any `--camera-host`, `--camera-port`, or `--camera-key` overrides and confirm that PyAV can open `libx264`.
-- **Distorted aspect:** Keep the profile at 1280x480. The bridge duplicates one 640x480 eye image into the 1280x480 side-by-side frame.
-- **High latency:** Confirm the bridge's ZMQ subscriber uses `CONFLATE` to keep the latest frame, check LAN quality, lower `--bitrate` if needed, and avoid relaying video through USB networking.
-- **Pose works but video does not:** Pose input and Remote Vision use independent connections. Check inbound TCP 13579 to the PC and outbound TCP 12345 to PICO.
-- **Video works but controls do not:** This bridge does not replace `pico_manager_thread_server.py`. Check the existing PICO pose and episode-control path separately.
+For MuJoCo startup, bridge commands, network ports, expected logs, and runtime
+troubleshooting, see
+[View the MuJoCo Ego Camera in XRoboToolkit](../../../docs/source/tutorials/data_collection.md#view-the-mujoco-ego-camera-in-xrobotoolkit).
 
 ## Restore the original profile
 
@@ -153,6 +107,11 @@ adb shell am force-stop com.xrobotoolkit.client
 
 Restart XRoboToolkit on the headset and confirm its original video sources return.
 
-## Current limitations
+## Profile troubleshooting
 
-The bridge duplicates a monoscopic image into both eyes; it does not provide stereo depth or a head-coupled camera. It requires a separate manual launch. XRoboToolkit version compatibility, display geometry, and end-to-end behavior still require hardware validation on PICO.
+- **`adb devices` shows no device:** Check the USB connection and USB mode,
+  enable developer options and USB debugging, accept the headset authorization
+  prompt, then retry `adb kill-server && adb start-server` and `adb devices`.
+- **`MUJOCO` is missing:** Parse and inspect the merged YAML, confirm the push
+  went to `/sdcard/Android/data/com.xrobotoolkit.client/files/video_source.yml`,
+  and restart the headset application.
