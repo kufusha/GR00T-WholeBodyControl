@@ -1,10 +1,12 @@
 from fractions import Fraction
+import queue
 import socket
 import threading
 
 import av
 import cv2
 import msgpack
+import msgpack_numpy
 import numpy as np
 import pytest
 import zmq
@@ -104,12 +106,14 @@ class ScriptedClient(FakeSocket):
         self.targets = targets
         self.observed = []
         self.closed = False
+        self.closed_event = threading.Event()
 
     def __enter__(self):
         return self
 
     def __exit__(self, *args):
         self.closed = True
+        self.closed_event.set()
 
     def settimeout(self, timeout):
         self.timeout = timeout
@@ -128,6 +132,7 @@ class ScriptedListener:
         self.stop_event = stop_event
         self.closed = False
         self.options = []
+        self.accepted = []
 
     def __enter__(self):
         return self
@@ -151,8 +156,11 @@ class ScriptedListener:
         try:
             client = next(self.clients)
         except StopIteration:
+            for client in self.accepted:
+                assert client.closed_event.wait(1.0)
             self.stop_event.set()
             raise socket.timeout
+        self.accepted.append(client)
         return client, ("192.168.0.77", 50000)
 
 
@@ -206,6 +214,67 @@ def test_control_server_clears_target_on_connection_error(monkeypatch):
 
     assert targets.snapshot() == (None, 1)
     assert client.closed and listener.closed
+
+
+def test_control_server_replaces_live_client_and_preserves_target_on_stale_disconnect(monkeypatch):
+    targets = PicoTargetStore()
+    stop = threading.Event()
+
+    class LiveClient(ScriptedClient):
+        def __init__(self, host):
+            super().__init__([f"OPEN_CAMERA {host}".encode(), socket.timeout()], targets)
+            self.incoming = queue.Queue()
+            self.registered = threading.Event()
+
+        def recv(self, size):
+            try:
+                return super().recv(size)
+            except StopIteration:
+                self.registered.set()
+                try:
+                    return self.incoming.get(timeout=self.timeout)
+                except queue.Empty:
+                    raise socket.timeout from None
+
+    class LiveListener(ScriptedListener):
+        def __init__(self):
+            super().__init__([], stop)
+            self.incoming = queue.Queue()
+
+        def accept(self):
+            try:
+                return self.incoming.get(timeout=0.1), ("192.168.0.77", 50000)
+            except queue.Empty:
+                raise socket.timeout from None
+
+    first, second = LiveClient("192.168.0.10"), LiveClient("192.168.0.11")
+    listener = LiveListener()
+    listener.incoming.put(first)
+    monkeypatch.setattr(socket, "socket", lambda *args: listener)
+    server = threading.Thread(target=run_control_server, args=(parse_args([]), targets, stop))
+    server.start()
+    try:
+        assert first.registered.wait(1.0)
+        assert targets.snapshot() == ("192.168.0.10", 1)
+        listener.incoming.put(second)
+
+        assert second.registered.wait(1.0), "A live old client blocked the replacement request"
+        assert not first.closed
+        assert targets.snapshot() == ("192.168.0.11", 2)
+
+        first.incoming.put(b"")
+        assert first.closed_event.wait(1.0)
+        assert targets.snapshot() == ("192.168.0.11", 2)
+
+        second.incoming.put(b"")
+        assert second.closed_event.wait(1.0)
+        assert targets.snapshot() == (None, 2)
+    finally:
+        stop.set()
+        first.incoming.put(b"")
+        second.incoming.put(b"")
+        server.join(timeout=2.0)
+    assert not server.is_alive() and listener.closed
 
 
 class FakeStopEvent(threading.Event):
@@ -523,6 +592,53 @@ def test_control_server_stops_bridge_when_listen_endpoint_is_unavailable(monkeyp
 
     assert stop.is_set() and listener.closed
     assert any("address in use" in r.message and r.levelname == "ERROR" for r in caplog.records)
+
+
+MALFORMED_ARRAYS = [
+    np.empty((0, 640, 3), dtype=np.uint8),
+    np.empty((480, 0, 3), dtype=np.uint8),
+    np.zeros((480, 640, 3), dtype=np.uint16),
+    np.zeros((480, 640, 3), dtype=np.float32),
+    np.zeros((480, 640, 3), dtype=np.bool_),
+    np.zeros((480, 640, 3), dtype=np.complex64),
+]
+
+
+def pack_numpy_camera_message(frame):
+    return msgpack.packb(
+        {"timestamps": {"ego_view": 1.0}, "images": {"ego_view": frame}},
+        default=msgpack_numpy.encode,
+        use_bin_type=True,
+    )
+
+
+@pytest.mark.parametrize("frame", MALFORMED_ARRAYS)
+def test_decode_camera_frame_rejects_empty_or_unsupported_numpy_images(frame):
+    with pytest.raises(CameraFrameError):
+        decode_camera_frame(pack_numpy_camera_message(frame), "ego_view")
+
+
+@pytest.mark.parametrize("frame", MALFORMED_ARRAYS)
+def test_video_loop_continues_after_empty_or_unsupported_numpy_image(monkeypatch, caplog, frame):
+    targets = PicoTargetStore()
+    targets.set("192.168.0.20")
+    stop = FakeStopEvent()
+    valid = np.zeros((480, 640, 3), dtype=np.uint8)
+    valid[:, :, 0] = 180
+    subscriber = ScriptedSubscriber(
+        [pack_numpy_camera_message(frame), pack_numpy_camera_message(valid)], stop
+    )
+    sock = VideoSocket()
+    connections = install_video_connections(monkeypatch, [sock])
+
+    run_video_loop(parse_args([]), targets, subscriber, stop)
+
+    frames = decode_video_socket(sock)
+    assert len(frames) == 1 and frames[0].shape == (480, 1280, 3)
+    assert np.mean(frames[0][:, :, 0]) > 170
+    assert connections == [(("192.168.0.20", 12345), 1.0)]
+    assert any("Camera decode failed" in r.message for r in caplog.records)
+    assert sock.closed
 
 
 def pack_camera_message(images: dict[str, np.ndarray]) -> bytes:

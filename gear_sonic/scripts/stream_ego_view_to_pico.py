@@ -116,6 +116,8 @@ def decode_camera_frame(raw_message: bytes, camera_key: str) -> np.ndarray:
 
     if not isinstance(frame, np.ndarray) or frame.ndim != 3 or frame.shape[2] != 3:
         raise CameraFrameError(f"Camera '{camera_key}' must be an HxWx3 image")
+    if frame.shape[0] == 0 or frame.shape[1] == 0 or frame.dtype != np.uint8:
+        raise CameraFrameError(f"Camera '{camera_key}' must be a nonempty uint8 image")
     return np.ascontiguousarray(frame)
 
 
@@ -233,6 +235,12 @@ def run_control_server(
     config: PicoStreamConfig, targets: PicoTargetStore, stop_event: threading.Event
 ) -> None:
     """Serve bounded XRoboToolkit requests until shutdown."""
+    clients = []
+
+    def serve_client(client: socket.socket, peer_ip: str) -> None:
+        with client:
+            _handle_control_client(client, peer_ip, targets, stop_event)
+
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
             listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -245,11 +253,21 @@ def run_control_server(
                     client, address = listener.accept()
                 except socket.timeout:
                     continue
-                with client:
-                    _handle_control_client(client, address[0], targets, stop_event)
+                clients = [worker for worker in clients if worker.is_alive()]
+                worker = threading.Thread(
+                    target=serve_client,
+                    args=(client, address[0]),
+                    name="xrobotoolkit-control-client",
+                    daemon=True,
+                )
+                clients.append(worker)
+                worker.start()
     except OSError as error:
         LOGGER.error("Control server failed: %s", error)
         stop_event.set()
+    finally:
+        for worker in clients:
+            worker.join(timeout=0.5)
 
 
 def _close_video_connection(sock: socket.socket | None, encoder: H264Encoder | None) -> None:
