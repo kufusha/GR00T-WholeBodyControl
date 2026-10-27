@@ -47,6 +47,66 @@ from gear_sonic.trl.utils.torch_transform import (
     quaternion_to_rotation_matrix,
 )
 
+
+class _ManagerControlAction(Enum):
+    NONE = 1
+    START = 2
+    GUARDED_STOP = 3
+
+
+class _ManagerControlGesture:
+    def __init__(self):
+        self._previously_pressed = False
+
+    def update(self, *, pressed: bool, control_active: bool):
+        rising_edge = pressed and not self._previously_pressed
+        self._previously_pressed = pressed
+        if not rising_edge:
+            return _ManagerControlAction.NONE
+        if control_active:
+            return _ManagerControlAction.GUARDED_STOP
+        return _ManagerControlAction.START
+
+
+class _GuardedStopLatch:
+    def __init__(self):
+        self._pending = False
+
+    @property
+    def streaming_enabled(self) -> bool:
+        return not self._pending
+
+    def request(self) -> bool:
+        if self._pending:
+            return False
+        self._pending = True
+        return True
+
+
+def _decode_handoff_status(payload: bytes):
+    try:
+        return msgpack.unpackb(payload, raw=False)
+    except (ValueError, TypeError, msgpack.ExtraData):
+        return None
+
+
+def _is_walkrun_return_confirmed(payload: bytes) -> bool:
+    status = _decode_handoff_status(payload)
+    return (
+        isinstance(status, dict)
+        and status.get("event") == "walkrun_return_confirmed"
+        and status.get("fsm_id") == 801
+    )
+
+
+def _is_emergency_stop_requested(payload: bytes) -> bool:
+    status = _decode_handoff_status(payload)
+    return (
+        isinstance(status, dict)
+        and status.get("event") == "emergency_stop_requested"
+        and status.get("fsm_id") == 1
+    )
+
 try:
     from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
         build_command_message,
@@ -1917,13 +1977,20 @@ def run_pico_manager(
     Manager: creates shared PUB socket and runs pose/planner streamers based on current mode.
     Controller input:
       A+X: Toggle between planner and pose mode
-      A+B+X+Y: Toggle policy start/stop
+      A+B+X+Y: Start from OFF or request the unified guarded stop
     """
     reader = _init_input_source(input_source, buffer_size)
 
     context = zmq.Context()
     socket = context.socket(zmq.PUB)
     socket.bind(f"tcp://*:{port}")
+    handoff_status_topic = b"handoff_status"
+    handoff_status_socket = context.socket(zmq.SUB)
+    handoff_status_socket.setsockopt(zmq.SUBSCRIBE, handoff_status_topic)
+    handoff_status_socket.setsockopt(zmq.CONFLATE, 1)
+    handoff_status_socket.connect(
+        f"tcp://{zmq_feedback_host}:{zmq_feedback_port}"
+    )
     time.sleep(0.1)
     print(f"[Manager] ZMQ socket bound to port {port}")
 
@@ -1975,22 +2042,53 @@ def run_pico_manager(
     #                                                        |
     #                                                   (ax)--> POSE
     #
-    #   Emergency stop from any mode: A+B+X+Y (start_combo) --> OFF
+    #   Unified control: A+B+X+Y starts from OFF or requests guarded stop.
     #   POSE_PAUSE: left_menu_button held --> POSE_PAUSE, released --> POSE
     #
-    print("Manager controls: A+X=toggle mode, A+B+X+Y=start/stop policy")
+    print(
+        "Manager controls: A+X=toggle mode, "
+        "A+B+X+Y=start/guarded stop"
+    )
     current_mode = StreamMode.OFF
     # Track which mode VR_3PT was entered from, so left_axis_click returns to it.
     # Will be either PLANNER or PLANNER_FROZEN_UPPER_BODY.
     vr3pt_parent_mode = StreamMode.PLANNER
     prev_toggle_dc = False
     prev_toggle_da = False
+    control_gesture = _ManagerControlGesture()
+    guarded_stop_latch = _GuardedStopLatch()
     try:
         prev_ax_pressed = False
         prev_by_pressed = False
-        prev_start_combo = False
         prev_left_axis_click = False
         while True:
+            try:
+                status_message = handoff_status_socket.recv(zmq.NOBLOCK)
+            except zmq.Again:
+                status_message = None
+
+            if status_message is not None:
+                status_payload = status_message[len(handoff_status_topic) :]
+                if _is_walkrun_return_confirmed(status_payload):
+                    print(
+                        "[Manager] WALKRUN return confirmed; stopping streams "
+                        "and closing ZMQ port 5556."
+                    )
+                    break
+                if _is_emergency_stop_requested(status_payload):
+                    print(
+                        "[Manager] Deploy requested emergency stop; using the "
+                        "existing OFF shutdown path."
+                    )
+                    socket.send(
+                        build_command_message(
+                            start=False,
+                            stop=True,
+                            planner=True,
+                        )
+                    )
+                    break
+
             # Poll Pico controller for buttons/axes
             a_pressed, b_pressed, x_pressed, y_pressed = get_abxy_buttons(reader)
 
@@ -2004,12 +2102,41 @@ def run_pico_manager(
             # Rising edge: B+Y pressed together -> toggle POSE/PLANNER_FROZEN_UPPER_BODY mode
             by_pressed = (b_pressed) and (y_pressed)
 
-            # Rising edge: A+B+X+Y pressed together -> toggle policy start/stop (planner=True)
+            # A+B+X+Y starts from OFF or requests the unified guarded stop.
             start_combo = (a_pressed) and (b_pressed) and (x_pressed) and (y_pressed)
+            control_action = control_gesture.update(
+                pressed=start_combo,
+                control_active=current_mode != StreamMode.OFF,
+            )
+            if (
+                control_action == _ManagerControlAction.GUARDED_STOP
+                and guarded_stop_latch.request()
+            ):
+                planner_enabled = current_mode in (
+                    StreamMode.PLANNER,
+                    StreamMode.PLANNER_FROZEN_UPPER_BODY,
+                    StreamMode.PLANNER_VR_3PT,
+                )
+                socket.send(
+                    build_command_message(
+                        start=False,
+                        stop=True,
+                        planner=planner_enabled,
+                    )
+                )
+                print(
+                    "[Manager] Unified guarded stop requested; "
+                    "teleoperation streaming is paused while waiting for "
+                    "deploy status."
+                )
+
+            if not guarded_stop_latch.streaming_enabled:
+                time.sleep(0.01)
+                continue
 
             new_mode = current_mode
             if current_mode == StreamMode.OFF:
-                if start_combo and not prev_start_combo:
+                if control_action == _ManagerControlAction.START:
                     new_mode = StreamMode.PLANNER
                     # Calibrate VR 3pt tracking NOW: operator should be in zero-ref pose.
                     # Uses the current Pico SMPL frame + FK of all-zero body joints.
@@ -2021,17 +2148,13 @@ def run_pico_manager(
 
             elif current_mode == StreamMode.PLANNER:
                 # Chain 2: POSE <--(ax)--> PLANNER <--(left_axis_click)--> VR_3PT
-                if start_combo and not prev_start_combo:
-                    new_mode = StreamMode.OFF
-                elif ax_pressed and not prev_ax_pressed:
+                if ax_pressed and not prev_ax_pressed:
                     new_mode = StreamMode.POSE
                 elif left_axis_click and not prev_left_axis_click:
                     new_mode = StreamMode.PLANNER_VR_3PT
 
             elif current_mode == StreamMode.POSE:
-                if start_combo and not prev_start_combo:
-                    new_mode = StreamMode.OFF
-                elif ax_pressed and not prev_ax_pressed:
+                if ax_pressed and not prev_ax_pressed:
                     new_mode = StreamMode.PLANNER  # Enter chain 2
                 elif by_pressed and not prev_by_pressed:
                     new_mode = StreamMode.PLANNER_FROZEN_UPPER_BODY  # Enter chain 1
@@ -2040,17 +2163,13 @@ def run_pico_manager(
 
             elif current_mode == StreamMode.PLANNER_FROZEN_UPPER_BODY:
                 # Chain 1: POSE <--(by)--> FROZEN <--(left_axis_click)--> VR_3PT
-                if start_combo and not prev_start_combo:
-                    new_mode = StreamMode.OFF
-                elif by_pressed and not prev_by_pressed:
+                if by_pressed and not prev_by_pressed:
                     new_mode = StreamMode.POSE
                 elif left_axis_click and not prev_left_axis_click:
                     new_mode = StreamMode.PLANNER_VR_3PT
 
             elif current_mode == StreamMode.POSE_PAUSE:
-                if start_combo and not prev_start_combo:
-                    new_mode = StreamMode.OFF
-                elif not left_menu_button:
+                if not left_menu_button:
                     new_mode = StreamMode.POSE
 
             elif current_mode == StreamMode.PLANNER_VR_3PT:
@@ -2058,9 +2177,7 @@ def run_pico_manager(
                 #   left_axis_click → return to parent (PLANNER or FROZEN)
                 #   ax_pressed      → POSE (chain 2 exit)
                 #   by_pressed      → POSE (chain 1 exit)
-                if start_combo and not prev_start_combo:
-                    new_mode = StreamMode.OFF
-                elif left_axis_click and not prev_left_axis_click:
+                if left_axis_click and not prev_left_axis_click:
                     new_mode = vr3pt_parent_mode  # Return to parent mode
                 elif ax_pressed and not prev_ax_pressed:
                     new_mode = StreamMode.POSE
@@ -2143,7 +2260,6 @@ def run_pico_manager(
 
             prev_ax_pressed = ax_pressed
             prev_by_pressed = by_pressed
-            prev_start_combo = start_combo
             prev_left_axis_click = left_axis_click
 
     except KeyboardInterrupt:
@@ -2152,6 +2268,7 @@ def run_pico_manager(
         # Cleanup resources
         reader.stop()
         three_point.close()
+        handoff_status_socket.close()
         socket.close()
         context.term()
         print("[Manager] Shutdown complete")

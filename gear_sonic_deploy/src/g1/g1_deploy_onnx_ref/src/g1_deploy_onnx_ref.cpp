@@ -4146,6 +4146,25 @@ class G1Deploy {
                                       reinitialize_heading_, heading_state_buffer_, has_planner, planner_state, movement_state_buffer_, current_motion_mutex_, report_temperature_);
       }
 
+      if (auto* zmq_manager =
+              dynamic_cast<ZMQManager*>(input_interface_.get())) {
+        if (zmq_manager->ConsumeGuardedReturnRequest()) {
+          if (warm_handoff_enabled_) {
+            guarded_return_requested_.store(true);
+          } else {
+            operator_state.stop = true;
+          }
+        }
+        if (warm_handoff_enabled_) {
+          if (zmq_manager->ConsumePoseEntry()) {
+            pose_entry_requested_.store(true);
+          }
+          if (zmq_manager->ConsumePoseExit()) {
+            pose_exit_requested_.store(true);
+          }
+        }
+      }
+
       if (playback_input_file_ && program_state_ == ProgramState::CONTROL) {
         std::string line;
         PlannerState ps{false, false};
@@ -4536,6 +4555,8 @@ class G1Deploy {
             operator_state.stop = true;
             break;
           }
+
+          if (warm_handoff_enabled_ && RunUserCtrlReturn()) { break; }
 
           // NEW: Get data with timestamps for loop timing analysis
           auto obs_start_time = std::chrono::steady_clock::now();
