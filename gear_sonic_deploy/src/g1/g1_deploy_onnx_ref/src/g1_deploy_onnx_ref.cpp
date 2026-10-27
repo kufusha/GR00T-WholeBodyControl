@@ -3197,6 +3197,10 @@ class G1Deploy {
       // CUDA resources are now cleaned up by the PolicyEngine and planner classes automatically
     }
 
+    bool ReturnedToInternalControl() const {
+      return userctrl_return_complete_;
+    }
+
     void SetThreadPriority() {
       struct sched_param param;
       param.sched_priority = sched_get_priority_max(SCHED_FIFO);
@@ -5220,5 +5224,15 @@ int main(int argc, char const* argv[]) {
   std::cout << "[DEBUG] Waiting for cleanup..." << std::endl;
   sleep(0.5);
   std::cout << "[DEBUG] Program exiting normally..." << std::endl;
+
+  if (ShouldBypassDdsDestructors(
+          warmHandoff, custom.ReturnedToInternalControl())) {
+    std::cout << "[DEBUG] Skipping CycloneDDS 0.10.2 entity destructors after "
+                 "confirmed WALKRUN return."
+              << std::endl;
+    std::cout.flush();
+    std::cerr.flush();
+    std::quick_exit(EXIT_SUCCESS);
+  }
   return 0;
 }
