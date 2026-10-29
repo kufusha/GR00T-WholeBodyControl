@@ -10,17 +10,16 @@
 namespace {
 
 constexpr auto kMaximumSampleAge = std::chrono::milliseconds(100);
-constexpr auto kStabilityWindow = std::chrono::seconds(1);
 constexpr auto kReturnIdleSettlementWindow = std::chrono::seconds(1);
 constexpr auto kTransitionTimeout = std::chrono::seconds(3);
 constexpr auto kPolicyBlendDuration = std::chrono::seconds(2);
-constexpr auto kReturnReferenceStabilityWindow =
-    std::chrono::milliseconds(300);
 constexpr float kMaximumJointVelocity = 0.2F;
 constexpr float kMaximumTiltRadians = 10.0F * 3.14159265358979323846F / 180.0F;
 constexpr float kMaximumTorsoAngularSpeed = 0.25F;
 constexpr float kMaximumLowerBodyReferenceDelta = 0.45F;
 constexpr float kMaximumUpperBodyReferenceDelta = 0.45F;
+constexpr float kMaximumShoulderYawReferenceDelta = 0.80F;
+constexpr float kMaximumPoseCommandTrackingError = 0.45F;
 constexpr float kMaximumHipYawMirrorError = 0.15F;
 constexpr float kMaximumKneeDifference = 0.12F;
 constexpr float kMaximumKneeFlexion = 0.80F;
@@ -28,6 +27,12 @@ constexpr float kMaximumAnklePitch = 0.50F;
 
 bool IsFinite(float value) {
   return std::isfinite(value);
+}
+
+float UpperBodyReferenceDeltaLimit(int joint) {
+  return joint == LeftShoulderYaw || joint == RightShoulderYaw
+             ? kMaximumShoulderYawReferenceDelta
+             : kMaximumUpperBodyReferenceDelta;
 }
 
 bool IsImmediateReturnRejection(UserCtrlRejectReason reason) {
@@ -76,7 +81,7 @@ UserCtrlRejectReason UserCtrlHandoffController::ValidateStableObservation(
     for (int joint = WaistYaw; joint < G1_NUM_MOTOR; ++joint) {
       if (std::fabs(observation.joint_position[joint] -
                     (*return_reference_position_)[joint]) >
-          kMaximumUpperBodyReferenceDelta) {
+          UpperBodyReferenceDeltaLimit(joint)) {
         return UserCtrlRejectReason::UPPER_BODY_POSE_MISMATCH;
       }
     }
@@ -129,59 +134,19 @@ UserCtrlRejectReason UserCtrlHandoffController::ValidateLowerBodyGeometry(
   return UserCtrlRejectReason::NONE;
 }
 
-void UserCtrlHandoffController::UpdateReturnReferenceCapture(
-    const UserCtrlObservation& observation, TimePoint now) {
-  if (!return_reference_capture_pending_) { return; }
-
-  const auto reason = ValidateStableObservation(
-      observation, now, kUserControlFsmId, false);
-  if (reason != UserCtrlRejectReason::NONE) {
-    return_reference_stable_since_.reset();
-    return_reference_samples_.clear();
-  } else {
-    if (!return_reference_stable_since_) {
-      return_reference_stable_since_ = now;
-    }
-    return_reference_samples_.push_back(observation.joint_position);
-    if (now - *return_reference_stable_since_ >=
-        kReturnReferenceStabilityWindow) {
-      std::array<float, G1_NUM_MOTOR> median{};
-      for (int joint = 0; joint < G1_NUM_MOTOR; ++joint) {
-        std::vector<float> values;
-        values.reserve(return_reference_samples_.size());
-        for (const auto& sample : return_reference_samples_) {
-          values.push_back(sample[joint]);
-        }
-        const auto middle = values.begin() + values.size() / 2;
-        std::nth_element(values.begin(), middle, values.end());
-        median[joint] = *middle;
-      }
-      return_reference_position_ = median;
-      return_reference_capture_pending_ = false;
-      return_reference_stable_since_.reset();
-      return_reference_samples_.clear();
-      return;
-    }
-  }
-}
-
 void UserCtrlHandoffController::ObserveStability(
     const UserCtrlObservation& observation, TimePoint now, int required_fsm,
     UserCtrlHandoffState ready_state) {
   rejection_reason_ = ValidateStableObservation(observation, now, required_fsm);
-  if (rejection_reason_ != UserCtrlRejectReason::NONE) {
-    stable_since_.reset();
-    return;
+  if (rejection_reason_ == UserCtrlRejectReason::NONE) {
+    state_ = ready_state;
   }
-  if (!stable_since_) { stable_since_ = now; }
-  if (now - *stable_since_ >= kStabilityWindow) { state_ = ready_state; }
 }
 
 void UserCtrlHandoffController::Observe(
     const UserCtrlObservation& observation, TimePoint now) {
   if (!enabled_) { return; }
   latest_observation_ = observation;
-  UpdateReturnReferenceCapture(observation, now);
 
   switch (state_) {
     case UserCtrlHandoffState::STABILIZING:
@@ -200,21 +165,23 @@ void UserCtrlHandoffController::Observe(
         state_ = UserCtrlHandoffState::BLENDING;
       } else if (observation.fsm_id == kWalkrunFsmId) {
         transition_deadline_.reset();
-        stable_since_.reset();
         state_ = UserCtrlHandoffState::STABILIZING;
       }
       break;
     case UserCtrlHandoffState::RETURN_STABILIZING:
-      if (!return_stabilization_started_at_) {
-        return_stabilization_started_at_ = now;
+      if (!return_stabilization_started_at_ ||
+          now - *return_stabilization_started_at_ >=
+              kReturnIdleSettlementWindow) {
+        RequestEmergencyStop(now);
+        break;
+      }
+      if (observation.sample_time <= *return_stabilization_started_at_) {
+        break;
       }
       ObserveStability(observation, now, kUserControlFsmId,
                        UserCtrlHandoffState::RETURN_READY);
       if (state_ == UserCtrlHandoffState::RETURN_STABILIZING &&
-          rejection_reason_ != UserCtrlRejectReason::NONE &&
-          (IsImmediateReturnRejection(rejection_reason_) ||
-           now - *return_stabilization_started_at_ >=
-               kReturnIdleSettlementWindow)) {
+          IsImmediateReturnRejection(rejection_reason_)) {
         RequestEmergencyStop(now);
       }
       break;
@@ -243,8 +210,14 @@ void UserCtrlHandoffController::CaptureHold() {
 }
 
 std::optional<std::uint64_t> UserCtrlHandoffController::RequestEntry(
-    TimePoint) {
+    TimePoint now) {
   if (state_ != UserCtrlHandoffState::READY || !latest_observation_) {
+    return std::nullopt;
+  }
+  rejection_reason_ = ValidateStableObservation(
+      *latest_observation_, now, kWalkrunFsmId);
+  if (rejection_reason_ != UserCtrlRejectReason::NONE) {
+    state_ = UserCtrlHandoffState::STABILIZING;
     return std::nullopt;
   }
   CaptureHold();
@@ -275,27 +248,27 @@ void UserCtrlHandoffController::MarkUserSwitchAccepted(TimePoint now) {
   transition_deadline_ = now + kTransitionTimeout;
 }
 
-bool UserCtrlHandoffController::RequestReturnReferenceCapture(TimePoint) {
+bool UserCtrlHandoffController::TryCaptureReturnReference(
+    const std::array<float, G1_NUM_MOTOR>& command_position, TimePoint now) {
   if ((state_ != UserCtrlHandoffState::BLENDING &&
        state_ != UserCtrlHandoffState::ACTIVE) ||
-      return_reference_capture_attempted_) {
+      return_reference_position_ || !latest_observation_) {
     return false;
   }
-  return_reference_capture_attempted_ = true;
-  return_reference_capture_pending_ = true;
-  return_reference_stable_since_.reset();
-  return_reference_samples_.clear();
-  return true;
-}
-
-bool UserCtrlHandoffController::CancelReturnReferenceCapture() {
-  if (!return_reference_capture_pending_ || return_reference_position_) {
+  if (ValidateStableObservation(
+          *latest_observation_, now, kUserControlFsmId, false) !=
+      UserCtrlRejectReason::NONE) {
     return false;
   }
-  return_reference_capture_attempted_ = false;
-  return_reference_capture_pending_ = false;
-  return_reference_stable_since_.reset();
-  return_reference_samples_.clear();
+  for (std::size_t joint = 0; joint < command_position.size(); ++joint) {
+    if (!IsFinite(command_position[joint]) ||
+        std::fabs(command_position[joint] -
+                  latest_observation_->joint_position[joint]) >
+            kMaximumPoseCommandTrackingError) {
+      return false;
+    }
+  }
+  return_reference_position_ = latest_observation_->joint_position;
   return true;
 }
 
@@ -348,6 +321,8 @@ UserCtrlHandoffController::return_readiness(TimePoint now) const {
     if (delta > readiness.max_upper_body_delta) {
       readiness.max_upper_body_delta = delta;
       readiness.max_upper_body_joint = joint;
+      readiness.upper_body_delta_limit =
+          UpperBodyReferenceDeltaLimit(joint);
     }
   }
 
@@ -399,14 +374,13 @@ UserCtrlHandoffController::TransformPolicyPosition(
   return transformed;
 }
 
-bool UserCtrlHandoffController::RequestReturn() {
+bool UserCtrlHandoffController::RequestReturn(TimePoint now) {
   if (state_ != UserCtrlHandoffState::BLENDING &&
       state_ != UserCtrlHandoffState::ACTIVE) {
     return false;
   }
   state_ = UserCtrlHandoffState::RETURN_STABILIZING;
-  stable_since_.reset();
-  return_stabilization_started_at_.reset();
+  return_stabilization_started_at_ = now;
   rejection_reason_ = UserCtrlRejectReason::NONE;
   return true;
 }
@@ -421,12 +395,24 @@ bool UserCtrlHandoffController::RequestStop(
     RequestEmergencyStop(now);
     return true;
   }
-  return RequestReturn();
+  return RequestReturn(now);
 }
 
 std::optional<std::uint64_t> UserCtrlHandoffController::BeginReturn(
-    TimePoint) {
+    TimePoint now) {
   if (state_ != UserCtrlHandoffState::RETURN_READY || !latest_observation_) {
+    return std::nullopt;
+  }
+  if (!return_stabilization_started_at_ ||
+      now - *return_stabilization_started_at_ >=
+          kReturnIdleSettlementWindow) {
+    RequestEmergencyStop(now);
+    return std::nullopt;
+  }
+  rejection_reason_ = ValidateStableObservation(
+      *latest_observation_, now, kUserControlFsmId);
+  if (rejection_reason_ != UserCtrlRejectReason::NONE) {
+    state_ = UserCtrlHandoffState::RETURN_STABILIZING;
     return std::nullopt;
   }
   CaptureHold();
@@ -459,7 +445,6 @@ void UserCtrlHandoffController::RequestEmergencyStop(TimePoint) {
     return;
   }
   state_ = UserCtrlHandoffState::EMERGENCY_DAMPING;
-  stable_since_.reset();
   return_stabilization_started_at_.reset();
   transition_deadline_.reset();
 }

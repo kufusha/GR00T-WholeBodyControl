@@ -302,8 +302,6 @@ class G1Deploy {
     std::chrono::steady_clock::time_point userctrl_return_confirmed_at_{};
     bool userctrl_uncertain_logged_ = false;
     std::chrono::steady_clock::time_point last_return_readiness_log_{};
-    std::optional<std::chrono::steady_clock::time_point>
-        return_readiness_safe_since_;
     bool return_entry_pose_logged_ = false;
     bool return_reference_captured_logged_ = false;
     std::atomic<bool> guarded_return_requested_{false};
@@ -2401,33 +2399,24 @@ class G1Deploy {
       return false;
     }
 
-    void LogUserCtrlReturnReadiness(
+    bool LogUserCtrlReturnReadiness(
         std::chrono::steady_clock::time_point now) {
       if (userctrl_handoff_.state() != UserCtrlHandoffState::ACTIVE) {
-        return;
+        return false;
       }
       // FSM 1000 was confirmed before ACTIVE. Avoid synchronous RPC calls in
       // the real-time control loop while sampling return readiness.
-      if (!ObserveUserCtrl(now, false, false)) { return; }
+      if (!ObserveUserCtrl(now, false, false)) { return false; }
 
       const auto readiness = userctrl_handoff_.return_readiness(now);
-      if (!readiness) {
-        return_readiness_safe_since_.reset();
-        return;
-      }
-
-      if (readiness->reason == UserCtrlRejectReason::NONE) {
-        if (!return_readiness_safe_since_) {
-          return_readiness_safe_since_ = now;
-        }
-      } else {
-        return_readiness_safe_since_.reset();
-      }
+      if (!readiness) { return false; }
+      const bool return_ready =
+          readiness->reason == UserCtrlRejectReason::NONE;
 
       if (last_return_readiness_log_ !=
               std::chrono::steady_clock::time_point{} &&
           now - last_return_readiness_log_ < std::chrono::seconds(1)) {
-        return;
+        return return_ready;
       }
       last_return_readiness_log_ = now;
 
@@ -2443,14 +2432,7 @@ class G1Deploy {
           "RightShoulderYaw",   "RightElbow",         "RightWristRoll",
           "RightWristPitch",    "RightWristYaw"};
 
-      const bool stable_for_one_second =
-          return_readiness_safe_since_ &&
-          now - *return_readiness_safe_since_ >= std::chrono::seconds(1);
-      const char* status = stable_for_one_second
-                               ? "READY"
-                               : (readiness->reason == UserCtrlRejectReason::NONE
-                                      ? "STABILIZING"
-                                      : "NOT_READY");
+      const char* status = return_ready ? "READY" : "NOT_READY";
       const int lower_joint = readiness->max_lower_body_joint;
       const char* lower_joint_name =
           lower_joint >= LeftHipPitch && lower_joint <= RightAnkleRoll
@@ -2514,11 +2496,12 @@ class G1Deploy {
       std::cout << "[SafeReturn] Current upper-body q="
                 << format_upper_pose(readiness->current_upper_body)
                 << std::endl;
-      if (!stable_for_one_second) {
+      if (!return_ready) {
         std::cout << "[SafeReturn] A stop requested now will use "
                      "emergency damping immediately."
                   << std::endl;
       }
+      return return_ready;
     }
 
     bool RunUserCtrlReturn() {
@@ -2526,49 +2509,23 @@ class G1Deploy {
       const auto initial_state = userctrl_handoff_.state();
 
       if (pose_exit_requested_.exchange(false)) {
-        if (userctrl_handoff_.CancelReturnReferenceCapture()) {
-          std::cout << "[ControlHandoff] POSE exited before a stable return "
-                       "reference was captured; the next POSE entry may "
-                       "retry."
-                    << std::endl;
-        }
+        pose_entry_requested_.store(false);
       }
 
-      if (pose_entry_requested_.exchange(false)) {
-        if (userctrl_handoff_.RequestReturnReferenceCapture(now)) {
-          return_readiness_safe_since_.reset();
-          return_entry_pose_logged_ = false;
-          std::cout << "[ControlHandoff] POSE mode entered; capturing a stable "
-                       "return reference for 300 ms."
-                    << std::endl;
-        } else if (userctrl_handoff_.has_return_reference()) {
-          std::cout << "[ControlHandoff] POSE return reference already captured; "
-                       "keeping the first reference for this session."
-                    << std::endl;
-        } else {
-          std::cout << "[ControlHandoff] POSE return-reference request ignored in "
-                       "state "
-                    << ToString(initial_state) << "." << std::endl;
-        }
-      }
-
-      LogUserCtrlReturnReadiness(now);
+      const bool return_ready = LogUserCtrlReturnReadiness(now);
 
       if (userctrl_handoff_.has_return_reference() &&
           !return_reference_captured_logged_) {
         return_reference_captured_logged_ = true;
-        std::cout << "[ControlHandoff] Stable POSE return reference captured."
+        std::cout << "[ControlHandoff] POSE return reference captured."
                   << std::endl;
       }
 
       if (guarded_return_requested_.exchange(false)) {
-        const bool return_ready =
-            return_readiness_safe_since_ &&
-            now - *return_readiness_safe_since_ >= std::chrono::seconds(1);
         if (userctrl_handoff_.RequestStop(return_ready, now) && return_ready) {
           ForceUserCtrlIdleInput();
           std::cout << "[ControlHandoff] Returning control to WALKRUN; "
-                       "commanding IDLE and checking stable posture."
+                       "commanding IDLE and checking return posture."
                     << std::endl;
         } else if (userctrl_handoff_.state() ==
                    UserCtrlHandoffState::EMERGENCY_DAMPING) {
@@ -2635,7 +2592,7 @@ class G1Deploy {
 
       if (userctrl_handoff_.state() == UserCtrlHandoffState::RETURN_READY) {
         if (!userctrl_return_ready_logged_) {
-          std::cout << "[ControlHandoff] Stable return posture confirmed; "
+          std::cout << "[ControlHandoff] Return posture confirmed; "
                        "replacing policy output with a measured-pose hold."
                     << std::endl;
           userctrl_return_ready_logged_ = true;
@@ -4668,6 +4625,20 @@ class G1Deploy {
             return;
           }
           auto motor_command_end_time = std::chrono::steady_clock::now();
+          if (pose_entry_requested_.load() && current_motion_copy &&
+              current_motion_copy->name == "streamed") {
+            const auto command = motor_command_buffer_.GetDataWithTime().data;
+            if (command && userctrl_handoff_.TryCaptureReturnReference(
+                               command->q_target, motor_command_end_time)) {
+              pose_entry_requested_.store(false);
+              return_entry_pose_logged_ = false;
+            } else if (userctrl_handoff_.has_return_reference()) {
+              pose_entry_requested_.store(false);
+              std::cout << "[ControlHandoff] POSE return reference already captured; "
+                           "keeping the first reference for this session."
+                        << std::endl;
+            }
+          }
 
           // Update Dex3 hands max close ratio from keyboard-controlled value (X/C keys)
           dex3_hands_.SetMaxCloseRatio(input_interface_->GetMaxCloseRatio());

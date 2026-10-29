@@ -5,7 +5,6 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
-#include <vector>
 #include <string_view>
 
 #include "robot_parameters.hpp"
@@ -165,13 +164,13 @@ class UserCtrlHandoffController {
       const std::array<float, G1_NUM_MOTOR>& policy_position,
       TimePoint now);
 
-  bool RequestReturnReferenceCapture(TimePoint now);
-  bool CancelReturnReferenceCapture();
+  bool TryCaptureReturnReference(
+      const std::array<float, G1_NUM_MOTOR>& command_position, TimePoint now);
   bool has_return_reference() const;
   const std::optional<std::array<float, G1_NUM_MOTOR>>&
   return_reference_position() const;
 
-  bool RequestReturn();
+  bool RequestReturn(TimePoint now);
   bool RequestStop(bool return_ready, TimePoint now);
   std::optional<std::uint64_t> BeginReturn(TimePoint now);
   void MarkInternalSwitchAccepted(TimePoint now);
@@ -199,8 +198,6 @@ class UserCtrlHandoffController {
       int required_fsm, bool require_return_reference = true) const;
   UserCtrlRejectReason ValidateLowerBodyGeometry(
       const UserCtrlObservation& observation) const;
-  void UpdateReturnReferenceCapture(
-      const UserCtrlObservation& observation, TimePoint now);
   void ObserveStability(const UserCtrlObservation& observation, TimePoint now,
                         int required_fsm, UserCtrlHandoffState ready_state);
   void CaptureHold();
@@ -208,17 +205,11 @@ class UserCtrlHandoffController {
   bool enabled_ = false;
   UserCtrlHandoffState state_ = UserCtrlHandoffState::DISABLED;
   UserCtrlRejectReason rejection_reason_ = UserCtrlRejectReason::NONE;
-  std::optional<TimePoint> stable_since_;
   std::optional<TimePoint> return_stabilization_started_at_;
   std::optional<TimePoint> transition_deadline_;
   std::optional<TimePoint> blend_started_at_;
   std::optional<UserCtrlObservation> latest_observation_;
   std::optional<std::array<float, G1_NUM_MOTOR>> return_reference_position_;
-  std::optional<TimePoint> return_reference_stable_since_;
-  std::vector<std::array<float, G1_NUM_MOTOR>>
-      return_reference_samples_;
-  bool return_reference_capture_attempted_ = false;
-  bool return_reference_capture_pending_ = false;
   std::array<float, G1_NUM_MOTOR> hold_position_{};
   std::array<float, G1_NUM_MOTOR> policy_offset_{};
   std::uint64_t hold_generation_ = 0;
