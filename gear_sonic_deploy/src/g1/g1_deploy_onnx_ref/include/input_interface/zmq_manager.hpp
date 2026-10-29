@@ -33,7 +33,7 @@
  *
  *   Key  | Action
  *   -----|-------
- *   O/o  | Emergency stop
+ *   O/o  | Guarded return
  *   g/G, h/H | Left-hand compliance ±0.1
  *   b/B, v/V | Right-hand compliance ±0.1
  *   x/X, c/C | Hand max-close ratio ±0.1
@@ -51,6 +51,7 @@
 #include <thread>
 #include <chrono>
 #include <mutex>
+#include <atomic>
 
 #include "input_interface.hpp"
 #include "input_command.hpp"
@@ -156,6 +157,18 @@ class ZMQManager : public InputInterface {
       if (planner_subscriber_) planner_subscriber_->Stop();
     }
 
+    bool ConsumeGuardedReturnRequest() {
+      return guarded_return_requested_.exchange(false);
+    }
+
+    bool ConsumePoseEntry() {
+      return pose_entry_requested_.exchange(false);
+    }
+
+    bool ConsumePoseExit() {
+      return pose_exit_requested_.exchange(false);
+    }
+
     void update() override {
       // Reset per-frame flags
       emergency_stop_ = false;
@@ -170,9 +183,8 @@ class ZMQManager : public InputInterface {
         switch (ch) {
           case 'o':
           case 'O':
-            emergency_stop_ = true;
+            stop_control_ = true;
             is_manager_key = true;
-            std::cout << "[ZMQManager] EMERGENCY STOP (O/o)" << std::endl;
             break;
           case 'f':
           case 'F':
@@ -242,6 +254,11 @@ class ZMQManager : public InputInterface {
           ManagedMode new_mode = latest_command_.planner ? ManagedMode::PLANNER : ManagedMode::STREAMED_MOTION;
           
           if (new_mode != active_mode_) {
+            if (active_mode_ == ManagedMode::PLANNER) {
+              pose_entry_requested_.store(true);
+            } else {
+              pose_exit_requested_.store(true);
+            }
             // Trigger safety reset on mode switch
             TriggerSafetyReset();
             if (pose_interface_) {
@@ -341,23 +358,8 @@ class ZMQManager : public InputInterface {
 
       // Handle stop control
       if (stop_control_) {
-        operator_state.stop = true;
-        if (planner_state.enabled) {
-          planner_state.enabled = false;
-          planner_state.initialized = false;
-        }
-        
-        // Clear planner buffer on stop
-        {
-          std::lock_guard<std::mutex> lock(planner_mutex_);
-          latest_planner_message_.valid = false;
-          latest_planner_message_.timestamp = {};
-        }
-        // Clear upper body control state
-        has_upper_body_control_ = false;
-        
-        // Clear hand joints control state
-        has_hand_joints_ = false;
+        guarded_return_requested_.store(true);
+        std::cout << "[ZMQManager] Guarded return requested." << std::endl;
       }
 
       // Delegate based on current mode
@@ -744,7 +746,7 @@ class ZMQManager : public InputInterface {
           cmd.planner = (val != 0);
         }
       }
-      
+
       // Update buffer with OR logic to accumulate start/stop signals
       std::lock_guard<std::mutex> lock(command_mutex_);
       
@@ -1238,10 +1240,13 @@ class ZMQManager : public InputInterface {
     // ------------------------------------------------------------------
     // Per-frame control flags (reset at start of update())
     // ------------------------------------------------------------------
-    bool emergency_stop_ = false;  ///< Set by 'O'/'o' keyboard shortcut.
+    bool emergency_stop_ = false;  ///< Reserved for internal emergency requests.
     bool report_temperature_flag_ = false;  ///< Set by 'F'/'f' keyboard shortcut.
     bool start_control_ = false;   ///< Start request from command message.
     bool stop_control_ = false;    ///< Stop request from command message.
+    std::atomic<bool> guarded_return_requested_{false};
+    std::atomic<bool> pose_entry_requested_{false};
+    std::atomic<bool> pose_exit_requested_{false};
 
     /// True once the planner has been initialised and is generating motions.
     bool is_planner_ready_ = false;

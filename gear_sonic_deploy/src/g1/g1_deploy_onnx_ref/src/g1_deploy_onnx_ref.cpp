@@ -63,10 +63,14 @@
 #include <functional>
 #include <unordered_map>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
+#include <sstream>
 #include <chrono>
 #include <algorithm>
 #include <numeric>
+#include <atomic>
+#include <cstdlib>
 
 // DDS
 #include <unitree/robot/channel/channel_publisher.hpp>
@@ -104,6 +108,7 @@
 #include "../include/robot_parameters.hpp"
 #include "../include/policy_parameters.hpp"
 #include "../include/motor_gain_scaling.hpp"
+#include "../include/managed_handoff.hpp"
 
 // Input interface and input handlers
 #include "../include/input_interface/keyboard_handler.hpp"
@@ -280,6 +285,28 @@ class G1Deploy {
     // External clients and peripheral managers
     // =========================================================================
     std::unique_ptr<unitree::robot::b2::MotionSwitcherClient> msc_;
+    std::unique_ptr<ManagedLocoClient> loco_client_;
+
+    bool warm_handoff_enabled_ = false;
+    UserCtrlHandoffController userctrl_handoff_{false};
+    int userctrl_fsm_id_ = -1;
+    std::chrono::steady_clock::time_point last_userctrl_fsm_poll_{};
+    std::atomic<std::uint64_t> requested_hold_generation_{0};
+    std::atomic<std::uint64_t> written_hold_generation_{0};
+    std::atomic<bool> userctrl_body_write_enabled_{false};
+    UserCtrlRejectReason last_userctrl_rejection_ =
+        UserCtrlRejectReason::NONE;
+    bool userctrl_ready_logged_ = false;
+    bool userctrl_return_ready_logged_ = false;
+    bool userctrl_return_complete_ = false;
+    std::chrono::steady_clock::time_point userctrl_return_confirmed_at_{};
+    bool userctrl_uncertain_logged_ = false;
+    std::chrono::steady_clock::time_point last_return_readiness_log_{};
+    bool return_entry_pose_logged_ = false;
+    bool return_reference_captured_logged_ = false;
+    std::atomic<bool> guarded_return_requested_{false};
+    std::atomic<bool> pose_entry_requested_{false};
+    std::atomic<bool> pose_exit_requested_{false};
     
     // Dex3 hands manager
     Dex3Hands dex3_hands_;
@@ -2146,6 +2173,489 @@ class G1Deploy {
       return false;
     }
 
+    MotorCommand CreateUserCtrlHoldCommand() const {
+      MotorCommand command;
+      const auto& hold = userctrl_handoff_.hold_position();
+      for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+        command.q_target[i] = hold[i];
+        command.dq_target[i] = 0.0F;
+        command.tau_ff[i] = 0.0F;
+        command.kp[i] = kps[i];
+        command.kd[i] = kds[i];
+      }
+      apply_motor_gain_scales(motor_gain_scales_, command);
+      return command;
+    }
+
+    void QueueUserCtrlHold(std::uint64_t generation) {
+      motor_command_buffer_.SetData(CreateUserCtrlHoldCommand());
+      written_hold_generation_.store(0, std::memory_order_release);
+      requested_hold_generation_.store(generation, std::memory_order_release);
+      userctrl_body_write_enabled_.store(true, std::memory_order_release);
+    }
+
+    void ForceUserCtrlIdleInput() {
+      operator_state.play = false;
+      std::array<double, 3> facing = {1.0, 0.0, 0.0};
+      const auto current = movement_state_buffer_.GetDataWithTime().data;
+      if (current) { facing = current->facing_direction; }
+      movement_state_buffer_.SetData(MovementState(
+          static_cast<int>(LocomotionMode::IDLE), {0.0F, 0.0F, 0.0F},
+          facing, -1.0F, -1.0F));
+    }
+
+    bool RefreshUserCtrlFsm(std::chrono::steady_clock::time_point now,
+                            bool force = false) {
+      if (!loco_client_) { return false; }
+      if (!force &&
+          last_userctrl_fsm_poll_ != std::chrono::steady_clock::time_point{} &&
+          now - last_userctrl_fsm_poll_ < std::chrono::milliseconds(100)) {
+        return userctrl_fsm_id_ >= 0;
+      }
+      last_userctrl_fsm_poll_ = now;
+      int fsm_id = -1;
+      const int32_t result = loco_client_->GetFsmId(fsm_id);
+      if (result != 0) {
+        if (userctrl_fsm_id_ < 0) {
+          std::cerr << "[ControlHandoff] GetFsmId failed with code " << result
+                    << "." << std::endl;
+        }
+        return false;
+      }
+      userctrl_fsm_id_ = fsm_id;
+      return true;
+    }
+
+    bool ObserveUserCtrl(std::chrono::steady_clock::time_point now,
+                         bool force_fsm = false,
+                         bool refresh_fsm = true) {
+      const auto low_state = low_state_buffer_.GetDataWithTime();
+      const auto torso_imu = imu_torso_buffer_.GetDataWithTime();
+      if (!low_state.data || !torso_imu.data) {
+        return false;
+      }
+      if (refresh_fsm && !RefreshUserCtrlFsm(now, force_fsm)) {
+        return false;
+      }
+      if (userctrl_fsm_id_ < 0) {
+        return false;
+      }
+
+      UserCtrlObservation observation;
+      observation.sample_time =
+          std::min(low_state.timestamp, torso_imu.timestamp);
+      observation.fsm_id = userctrl_fsm_id_;
+      for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+        observation.joint_position[i] = low_state.data->motor_state()[i].q();
+        observation.joint_velocity[i] = low_state.data->motor_state()[i].dq();
+      }
+      for (std::size_t i = 0; i < 3; ++i) {
+        observation.torso_rpy[i] = torso_imu.data->rpy()[i];
+        observation.torso_angular_velocity[i] =
+            torso_imu.data->gyroscope()[i];
+      }
+      userctrl_handoff_.Observe(observation, now);
+      return true;
+    }
+
+    void AcknowledgeUserCtrlHoldWrite(
+        std::chrono::steady_clock::time_point now) {
+      const std::uint64_t requested =
+          requested_hold_generation_.load(std::memory_order_acquire);
+      const std::uint64_t written =
+          written_hold_generation_.load(std::memory_order_acquire);
+      if (requested == 0 || written != requested) { return; }
+      if (userctrl_handoff_.AcknowledgeHoldWrite(requested, now)) {
+        requested_hold_generation_.store(0, std::memory_order_release);
+        std::cout << "[ControlHandoff] Measured-pose hold is active on "
+                  << BodyCommandTopic(true) << "." << std::endl;
+      }
+    }
+
+    bool RunUserCtrlEntry() {
+      const auto now = std::chrono::steady_clock::now();
+      ObserveUserCtrl(now);
+      userctrl_handoff_.CheckTransitionTimeout(now);
+      AcknowledgeUserCtrlHoldWrite(now);
+
+      const auto state = userctrl_handoff_.state();
+      const auto rejection = userctrl_handoff_.rejection_reason();
+      if (!userctrl_handoff_.body_publication_enabled()) {
+        userctrl_body_write_enabled_.store(false, std::memory_order_release);
+      }
+      if (state == UserCtrlHandoffState::STABILIZING &&
+          rejection != UserCtrlRejectReason::NONE &&
+          rejection != last_userctrl_rejection_) {
+        std::cout << "[ControlHandoff] Waiting: " << ToString(rejection) << "."
+                  << std::endl;
+      }
+      last_userctrl_rejection_ = rejection;
+
+      if (state == UserCtrlHandoffState::READY && !userctrl_ready_logged_) {
+        std::cout << "[ControlHandoff] READY: Robot is stable in WALKRUN and "
+                     "ready to transfer control to GEAR-SONIC. Send the ZMQ "
+                     "start command now."
+                  << std::endl;
+        userctrl_ready_logged_ = true;
+      } else if (state == UserCtrlHandoffState::STABILIZING) {
+        userctrl_ready_logged_ = false;
+      }
+
+      if (operator_state.start) {
+        operator_state.start = false;
+        const auto generation = userctrl_handoff_.RequestEntry(now);
+        if (!generation) {
+          std::cout << "[ControlHandoff] Start rejected: stable WALKRUN entry is "
+                       "not READY."
+                    << std::endl;
+        } else {
+          QueueUserCtrlHold(*generation);
+          std::cout << "[ControlHandoff] Current measured pose captured; "
+                       "publishing hold on "
+                    << BodyCommandTopic(true) << " before ownership transfer."
+                    << std::endl;
+        }
+      }
+
+      if (guarded_return_requested_.exchange(false)) {
+        if (userctrl_handoff_.RetryInternalSwitch(now)) {
+          userctrl_uncertain_logged_ = false;
+          std::cout << "[ControlHandoff] Retrying WALKRUN recovery while the "
+                       "measured-pose hold remains active."
+                    << std::endl;
+        } else {
+          std::cout << "[ControlHandoff] Recovery request ignored in state "
+                    << ToString(userctrl_handoff_.state()) << "." << std::endl;
+        }
+      }
+
+      if (userctrl_handoff_.ready_to_request_user_ctrl()) {
+        const int32_t result = loco_client_->SwitchToUserCtrl();
+        if (result == 0) {
+          userctrl_handoff_.MarkUserSwitchAccepted(now);
+          last_userctrl_fsm_poll_ = {};
+          std::cout << "[ControlHandoff] Transfer to GEAR-SONIC accepted; "
+                       "holding the measured pose until ownership is "
+                       "confirmed (FSM 1000)."
+                    << std::endl;
+        } else {
+          userctrl_handoff_.MarkUserSwitchRpcFailed(now);
+          last_userctrl_fsm_poll_ = {};
+          ObserveUserCtrl(now, true);
+          std::cerr << "[ControlHandoff] Transfer to GEAR-SONIC failed with "
+                       "code "
+                    << result << "; the measured-pose hold remains active "
+                       "until ownership is resolved."
+                    << std::endl;
+        }
+      }
+
+      if (userctrl_handoff_.ready_to_request_walkrun()) {
+        const int32_t result = loco_client_->SwitchToInternalCtrl(
+            ManagedInternalFsmMode::WALKRUN);
+        if (result == 0) {
+          userctrl_handoff_.MarkInternalSwitchAccepted(now);
+          last_userctrl_fsm_poll_ = {};
+          std::cout << "[ControlHandoff] Recovery transfer accepted; waiting for "
+                       "FSM 801."
+                    << std::endl;
+        } else {
+          userctrl_handoff_.MarkInternalSwitchRejected();
+          std::cerr << "[ControlHandoff] WALKRUN recovery failed with code "
+                    << result << "; the measured-pose hold remains active."
+                    << std::endl;
+        }
+      }
+
+      if (userctrl_handoff_.state() == UserCtrlHandoffState::COMPLETE) {
+        userctrl_return_complete_ = true;
+        userctrl_body_write_enabled_.store(false,
+                                           std::memory_order_release);
+        operator_state.stop = true;
+        std::cout << "[ControlHandoff] Recovery complete: WALKRUN owns body "
+                     "control (FSM 801)."
+                  << std::endl;
+        return false;
+      }
+
+      if (userctrl_handoff_.state() == UserCtrlHandoffState::BLENDING) {
+        program_state_ = ProgramState::CONTROL;
+        reinitialize_heading_ = true;
+        std::cout << "[ControlHandoff] GEAR-SONIC now owns body control (FSM "
+                     "1000); blending from the measured pose."
+                  << std::endl;
+        return true;
+      }
+
+      if (userctrl_handoff_.state() ==
+              UserCtrlHandoffState::USER_OWNED_HOLD &&
+          !userctrl_uncertain_logged_) {
+        std::cerr << "[ControlHandoff] Ownership confirmation timed out; the "
+                     "measured-pose hold remains active. Press O to request "
+                     "WALKRUN recovery."
+                  << std::endl;
+        userctrl_uncertain_logged_ = true;
+      }
+      return false;
+    }
+
+    bool LogUserCtrlReturnReadiness(
+        std::chrono::steady_clock::time_point now) {
+      if (userctrl_handoff_.state() != UserCtrlHandoffState::ACTIVE) {
+        return false;
+      }
+      // FSM 1000 was confirmed before ACTIVE. Avoid synchronous RPC calls in
+      // the real-time control loop while sampling return readiness.
+      if (!ObserveUserCtrl(now, false, false)) { return false; }
+
+      const auto readiness = userctrl_handoff_.return_readiness(now);
+      if (!readiness) { return false; }
+      const bool return_ready =
+          readiness->reason == UserCtrlRejectReason::NONE;
+
+      if (last_return_readiness_log_ !=
+              std::chrono::steady_clock::time_point{} &&
+          now - last_return_readiness_log_ < std::chrono::seconds(1)) {
+        return return_ready;
+      }
+      last_return_readiness_log_ = now;
+
+      static constexpr std::array<const char*, G1_NUM_MOTOR> kJointNames = {
+          "LeftHipPitch",       "LeftHipRoll",        "LeftHipYaw",
+          "LeftKnee",           "LeftAnklePitch",     "LeftAnkleRoll",
+          "RightHipPitch",      "RightHipRoll",       "RightHipYaw",
+          "RightKnee",          "RightAnklePitch",    "RightAnkleRoll",
+          "WaistYaw",           "WaistRoll",          "WaistPitch",
+          "LeftShoulderPitch",  "LeftShoulderRoll",   "LeftShoulderYaw",
+          "LeftElbow",          "LeftWristRoll",      "LeftWristPitch",
+          "LeftWristYaw",       "RightShoulderPitch", "RightShoulderRoll",
+          "RightShoulderYaw",   "RightElbow",         "RightWristRoll",
+          "RightWristPitch",    "RightWristYaw"};
+
+      const char* status = return_ready ? "READY" : "NOT_READY";
+      const int lower_joint = readiness->max_lower_body_joint;
+      const char* lower_joint_name =
+          lower_joint >= LeftHipPitch && lower_joint <= RightAnkleRoll
+              ? kJointNames[lower_joint]
+              : "unknown";
+      const int upper_joint = readiness->max_upper_body_joint;
+      const char* upper_joint_name =
+          upper_joint >= WaistYaw && upper_joint < G1_NUM_MOTOR
+              ? kJointNames[upper_joint]
+              : "unknown";
+
+      std::ostringstream summary;
+      summary << std::fixed << std::setprecision(3)
+              << "[SafeReturn] " << status
+              << ": reason=" << ToString(readiness->reason)
+              << ", max lower-body delta="
+              << readiness->max_lower_body_delta << " rad ("
+              << lower_joint_name
+              << ", limit=" << readiness->lower_body_delta_limit << ")"
+              << ", max upper-body delta="
+              << readiness->max_upper_body_delta << " rad ("
+              << upper_joint_name
+              << ", limit=" << readiness->upper_body_delta_limit << ")"
+              << ", max |dq|=" << readiness->max_joint_velocity
+              << " rad/s, torso roll/pitch=[" << readiness->torso_rpy[0]
+              << ", " << readiness->torso_rpy[1] << "] rad"
+              << ", torso angular speed="
+              << readiness->torso_angular_speed << " rad/s.";
+      std::cout << summary.str() << std::endl;
+
+      auto format_pose = [](const auto& pose) {
+        std::ostringstream values;
+        values << std::fixed << std::setprecision(3) << "[";
+        for (std::size_t i = 0; i < pose.size(); ++i) {
+          if (i != 0) { values << ", "; }
+          values << pose[i];
+        }
+        values << "]";
+        return values.str();
+      };
+      auto format_upper_pose = [](const auto& pose) {
+        std::ostringstream values;
+        values << std::fixed << std::setprecision(3) << "[";
+        for (int joint = WaistYaw; joint < G1_NUM_MOTOR; ++joint) {
+          if (joint != WaistYaw) { values << ", "; }
+          values << pose[joint];
+        }
+        values << "]";
+        return values.str();
+      };
+      if (!return_entry_pose_logged_) {
+        std::cout << "[SafeReturn] POSE reference lower-body q="
+                  << format_pose(readiness->reference_lower_body) << std::endl;
+        std::cout << "[SafeReturn] POSE reference upper-body q="
+                  << format_upper_pose(readiness->reference_upper_body)
+                  << std::endl;
+        return_entry_pose_logged_ = true;
+      }
+      std::cout << "[SafeReturn] Current lower-body q="
+                << format_pose(readiness->current_lower_body) << std::endl;
+      std::cout << "[SafeReturn] Current upper-body q="
+                << format_upper_pose(readiness->current_upper_body)
+                << std::endl;
+      if (!return_ready) {
+        std::cout << "[SafeReturn] A stop requested now will use "
+                     "emergency damping immediately."
+                  << std::endl;
+      }
+      return return_ready;
+    }
+
+    bool RunUserCtrlReturn() {
+      const auto now = std::chrono::steady_clock::now();
+      const auto initial_state = userctrl_handoff_.state();
+
+      if (pose_exit_requested_.exchange(false)) {
+        pose_entry_requested_.store(false);
+      }
+
+      const bool return_ready = LogUserCtrlReturnReadiness(now);
+
+      if (userctrl_handoff_.has_return_reference() &&
+          !return_reference_captured_logged_) {
+        return_reference_captured_logged_ = true;
+        std::cout << "[ControlHandoff] POSE return reference captured."
+                  << std::endl;
+      }
+
+      if (guarded_return_requested_.exchange(false)) {
+        if (userctrl_handoff_.RequestStop(return_ready, now) && return_ready) {
+          ForceUserCtrlIdleInput();
+          std::cout << "[ControlHandoff] Returning control to WALKRUN; "
+                       "commanding IDLE and checking return posture."
+                    << std::endl;
+        } else if (userctrl_handoff_.state() ==
+                   UserCtrlHandoffState::EMERGENCY_DAMPING) {
+          std::cerr << "[ControlHandoff] Stop requested while return posture "
+                       "was not READY; using the emergency shutdown path."
+                    << std::endl;
+        } else if (userctrl_handoff_.RetryInternalSwitch(now)) {
+          std::cout << "[ControlHandoff] Retrying WALKRUN ownership transfer "
+                       "while the measured-pose hold remains active."
+                    << std::endl;
+        } else {
+          std::cout << "[ControlHandoff] Return request ignored in state "
+                    << ToString(initial_state) << "." << std::endl;
+        }
+      }
+
+      const auto state_before_observe = userctrl_handoff_.state();
+      if (state_before_observe == UserCtrlHandoffState::RETURN_STABILIZING ||
+          state_before_observe == UserCtrlHandoffState::RETURN_READY ||
+          state_before_observe == UserCtrlHandoffState::WAITING_WALKRUN ||
+          state_before_observe == UserCtrlHandoffState::WAITING_PASSIVE) {
+        const bool observed = ObserveUserCtrl(now);
+        if (!observed &&
+            state_before_observe ==
+                UserCtrlHandoffState::RETURN_STABILIZING) {
+          userctrl_handoff_.RequestEmergencyStop(now);
+          std::cerr << "[ControlHandoff] Return safety observation unavailable; "
+                       "using the emergency shutdown path."
+                    << std::endl;
+        }
+      }
+      userctrl_handoff_.CheckTransitionTimeout(now);
+      AcknowledgeUserCtrlHoldWrite(now);
+
+      if (userctrl_handoff_.state() ==
+          UserCtrlHandoffState::EMERGENCY_DAMPING) {
+        const auto rejection = userctrl_handoff_.rejection_reason();
+        if (rejection == UserCtrlRejectReason::NONE) {
+          std::cerr << "[ControlHandoff] Return readiness was not confirmed; using "
+                       "the existing emergency shutdown path."
+                    << std::endl;
+        } else {
+          std::cerr << "[ControlHandoff] Return safety check failed ("
+                    << ToString(rejection)
+                    << "); using the existing emergency shutdown path."
+                    << std::endl;
+        }
+        operator_state.stop = true;
+        return true;
+      }
+
+      if (userctrl_handoff_.state() ==
+              UserCtrlHandoffState::RETURN_STABILIZING) {
+        ForceUserCtrlIdleInput();
+        const auto rejection = userctrl_handoff_.rejection_reason();
+        if (rejection != UserCtrlRejectReason::NONE &&
+            rejection != last_userctrl_rejection_) {
+          std::cout << "[ControlHandoff] Safe return waiting: "
+                    << ToString(rejection)
+                    << "." << std::endl;
+        }
+        last_userctrl_rejection_ = rejection;
+      }
+
+      if (userctrl_handoff_.state() == UserCtrlHandoffState::RETURN_READY) {
+        if (!userctrl_return_ready_logged_) {
+          std::cout << "[ControlHandoff] Return posture confirmed; "
+                       "replacing policy output with a measured-pose hold."
+                    << std::endl;
+          userctrl_return_ready_logged_ = true;
+        }
+        const auto generation = userctrl_handoff_.BeginReturn(now);
+        if (generation) { QueueUserCtrlHold(*generation); }
+      }
+
+      if (userctrl_handoff_.ready_to_request_walkrun()) {
+        const int32_t result = loco_client_->SwitchToInternalCtrl(
+            ManagedInternalFsmMode::WALKRUN);
+        if (result == 0) {
+          userctrl_handoff_.MarkInternalSwitchAccepted(now);
+          last_userctrl_fsm_poll_ = {};
+          std::cout << "[ControlHandoff] WALKRUN transfer accepted; keeping "
+                       "the measured-pose hold active until ownership is "
+                       "confirmed (FSM 801)."
+                    << std::endl;
+        } else {
+          userctrl_handoff_.MarkInternalSwitchRejected();
+          std::cerr << "[ControlHandoff] WALKRUN ownership transfer failed with "
+                       "code "
+                    << result << "; the measured-pose hold remains active."
+                    << std::endl;
+        }
+      }
+
+      if (userctrl_handoff_.state() == UserCtrlHandoffState::COMPLETE &&
+          !userctrl_return_complete_) {
+        userctrl_return_complete_ = true;
+        userctrl_return_confirmed_at_ = now;
+        userctrl_body_write_enabled_.store(false,
+                                           std::memory_order_release);
+        std::cout << "[ControlHandoff] SUCCESS: WALKRUN now owns body control "
+                     "(FSM 801); GEAR-SONIC body commands stopped."
+                  << std::endl;
+      }
+
+      if (userctrl_return_complete_) {
+        for (auto& output_interface : output_interfaces_) {
+          if (auto* zmq_output =
+                  dynamic_cast<ZMQOutputHandler*>(output_interface.get())) {
+            zmq_output->publish_walkrun_return_confirmed();
+          }
+        }
+        if (IsWalkrunReturnAckBroadcastComplete(userctrl_return_confirmed_at_,
+                                                now)) {
+          operator_state.stop = true;
+        }
+        return true;
+      }
+
+      if (userctrl_handoff_.state() ==
+              UserCtrlHandoffState::USER_OWNED_HOLD &&
+          !userctrl_uncertain_logged_) {
+        std::cerr << "[ControlHandoff] WALKRUN ownership confirmation failed; "
+                     "the measured-pose hold remains active. Press O to retry."
+                  << std::endl;
+        userctrl_uncertain_logged_ = true;
+      }
+      return !userctrl_handoff_.policy_enabled();
+    }
+
 
 
   public:
@@ -2180,7 +2690,8 @@ class G1Deploy {
       bool enable_motion_recording = false,
       std::array<double, 3> initial_compliance = {0.05, 0.05, 0.0},
       double initial_max_close_ratio = 1.0,
-      MotorGainScaleConfig motor_gain_scales = {})
+      MotorGainScaleConfig motor_gain_scales = {},
+      bool warm_handoff = false)
       : time_(0.0),
         publish_dt_(0.002),
         control_dt_(0.02),
@@ -2191,6 +2702,8 @@ class G1Deploy {
         mode_pr_(Mode::PR),
         mode_machine_(0),
         disable_crc_check_(disable_crc_check),
+        warm_handoff_enabled_(warm_handoff),
+        userctrl_handoff_(warm_handoff),
         program_state_(ProgramState::INIT),
         motor_gain_scales_(motor_gain_scales),
         last_action {0.0},
@@ -2277,18 +2790,30 @@ class G1Deploy {
       planner_motion_->ReserveCapacity(1500, 29, 1, 1, 0, 0);
       planner_motion_->timesteps = 0;
       planner_motion_->name = "planner_motion";
-      // try to shutdown motion control-related service
-      msc_ = std::make_unique<unitree::robot::b2::MotionSwitcherClient>();
-      msc_->SetTimeout(5.0f);
-      msc_->Init();
-      std::string form, name;
-      while (msc_->CheckMode(form, name), !name.empty()) {
-        if (msc_->ReleaseMode()) std::cout << "Failed to switch to Release Mode\n";
-        sleep(5);
+      if (warm_handoff_enabled_) {
+        loco_client_ = std::make_unique<ManagedLocoClient>();
+        loco_client_->SetTimeout(0.2F);
+        loco_client_->Init();
+        std::cout << "[ControlHandoff] Managed ownership handoff enabled. "
+                     "Official WALKRUN remains active during initialization."
+                  << std::endl;
+      } else {
+        // Preserve the legacy direct-lowcmd ownership release path.
+        msc_ = std::make_unique<unitree::robot::b2::MotionSwitcherClient>();
+        msc_->SetTimeout(5.0f);
+        msc_->Init();
+        std::string form, name;
+        while (msc_->CheckMode(form, name), !name.empty()) {
+          if (msc_->ReleaseMode()) {
+            std::cout << "Failed to switch to Release Mode\n";
+          }
+          sleep(5);
+        }
       }
 
       // create publisher
-      lowcmd_publisher_.reset(new ChannelPublisher<LowCmd_>(HG_CMD_TOPIC));
+      lowcmd_publisher_.reset(new ChannelPublisher<LowCmd_>(
+          std::string(BodyCommandTopic(warm_handoff_enabled_))));
       lowcmd_publisher_->InitChannel();
       // create subscriber
       lowstate_subscriber_.reset(new ChannelSubscriber<LowState_>(HG_STATE_TOPIC));
@@ -2629,6 +3154,10 @@ class G1Deploy {
       // CUDA resources are now cleaned up by the PolicyEngine and planner classes automatically
     }
 
+    bool ReturnedToInternalControl() const {
+      return userctrl_return_complete_;
+    }
+
     void SetThreadPriority() {
       struct sched_param param;
       param.sched_priority = sched_get_priority_max(SCHED_FIFO);
@@ -2697,7 +3226,10 @@ class G1Deploy {
       dds_low_command.mode_machine() = mode_machine_;
 
       const std::shared_ptr<const MotorCommand> mc = motor_command_buffer_.GetDataWithTime().data;
-      if (mc) {
+      const bool body_write_enabled =
+          !warm_handoff_enabled_ ||
+          userctrl_body_write_enabled_.load(std::memory_order_acquire);
+      if (mc && body_write_enabled) {
         for (size_t i = 0; i < G1_NUM_MOTOR; i++) {
           dds_low_command.motor_cmd().at(i).mode() = 1; // 1:Enable, 0:Disable
           dds_low_command.motor_cmd().at(i).tau() = mc->tau_ff.at(i);
@@ -2708,14 +3240,22 @@ class G1Deploy {
         }
 
         dds_low_command.crc() = Crc32Core((uint32_t*)&dds_low_command, (sizeof(dds_low_command) >> 2) - 1);
-        lowcmd_publisher_->Write(dds_low_command);
+        const bool write_succeeded = lowcmd_publisher_->Write(dds_low_command);
+        if (write_succeeded && warm_handoff_enabled_) {
+          const std::uint64_t generation =
+              requested_hold_generation_.load(std::memory_order_acquire);
+          if (generation != 0) {
+            written_hold_generation_.store(generation,
+                                            std::memory_order_release);
+          }
+        }
       }
 
       // Publish Dex3 hand commands at the same publish cadence
       dex3_hands_.writeOnce();
     }
 
-    /// Gracefully stop all threads and send a damping-only command.
+    /// Stop all threads and preserve the selected ownership shutdown path.
     void Stop() {
       operator_state.stop = true;
 
@@ -2731,9 +3271,74 @@ class G1Deploy {
           planner_thread_ptr_.reset();
         }
       }
+
+      if (warm_handoff_enabled_ && userctrl_return_complete_) {
+        std::cout << "[ControlHandoff] Shutdown complete; damping skipped because "
+                     "official WALKRUN owns the body."
+                  << std::endl;
+        return;
+      }
+
+      if (warm_handoff_enabled_ && loco_client_) {
+        const auto started = std::chrono::steady_clock::now();
+        const auto deadline = started + std::chrono::seconds(3);
+        auto next_emergency_status_publish = started;
+        userctrl_handoff_.RequestEmergencyStop(started);
+        userctrl_body_write_enabled_.store(true, std::memory_order_release);
+        CreateDampingCommand();
+        const int32_t result = loco_client_->SwitchToInternalCtrl(
+            ManagedInternalFsmMode::PASSIVE);
+        if (result == 0) {
+          userctrl_handoff_.MarkPassiveSwitchAccepted(started);
+        } else {
+          std::cerr << "[ControlHandoff] Emergency PASSIVE request failed with code "
+                    << result << "; continuing user-topic damping during the "
+                       "shutdown timeout."
+                    << std::endl;
+        }
+
+        bool passive_confirmed = false;
+        auto next_fsm_check = started;
+        while (std::chrono::steady_clock::now() < deadline) {
+          const auto now = std::chrono::steady_clock::now();
+          if (!passive_confirmed) { LowCommandWriter(); }
+          if (now >= next_emergency_status_publish) {
+            for (auto& output_interface : output_interfaces_) {
+              if (auto* zmq_output =
+                      dynamic_cast<ZMQOutputHandler*>(output_interface.get())) {
+                zmq_output->publish_emergency_stop_requested();
+              }
+            }
+            next_emergency_status_publish =
+                now + std::chrono::milliseconds(20);
+          }
+          if (now >= next_fsm_check) {
+            int fsm_id = -1;
+            if (loco_client_->GetFsmId(fsm_id) == 0 && fsm_id == 1) {
+              passive_confirmed = true;
+            }
+            next_fsm_check = now + std::chrono::milliseconds(50);
+          }
+          if (passive_confirmed &&
+              IsEmergencyStopBroadcastComplete(started, now)) {
+            break;
+          }
+          std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        if (passive_confirmed) {
+          std::cout << "[ControlHandoff] Emergency PASSIVE confirmed after damping."
+                    << std::endl;
+        } else {
+          std::cerr << "[ControlHandoff] Emergency PASSIVE was not confirmed before "
+                       "shutdown. Secure the robot."
+                    << std::endl;
+        }
+        return;
+      }
+
       CreateDampingCommand();
       LowCommandWriter();
-      std::cout << "Stop" << std::endl;
+      std::cout << "Stop (damping)" << std::endl;
     }
 
     /// Write a zero-torque, damping-only motor command (safe shutdown pose).
@@ -3161,6 +3766,12 @@ class G1Deploy {
         motor_command_tmp.kd.at(i) = kds[i];
         motor_command_tmp.dq_target.at(i) = 0.0;
       }
+      if (warm_handoff_enabled_) {
+        motor_command_tmp.q_target =
+            userctrl_handoff_.TransformPolicyPosition(
+                motor_command_tmp.q_target,
+                std::chrono::steady_clock::now());
+      }
       apply_motor_gain_scales(motor_gain_scales_, motor_command_tmp);
       motor_command_buffer_.SetData(motor_command_tmp);
       return true;
@@ -3494,6 +4105,25 @@ class G1Deploy {
         PlannerState planner_state{false, false};
         input_interface_->handle_input(motion_reader_, current_motion_, current_frame_, operator_state,
                                       reinitialize_heading_, heading_state_buffer_, has_planner, planner_state, movement_state_buffer_, current_motion_mutex_, report_temperature_);
+      }
+
+      if (auto* zmq_manager =
+              dynamic_cast<ZMQManager*>(input_interface_.get())) {
+        if (zmq_manager->ConsumeGuardedReturnRequest()) {
+          if (warm_handoff_enabled_) {
+            guarded_return_requested_.store(true);
+          } else {
+            operator_state.stop = true;
+          }
+        }
+        if (warm_handoff_enabled_) {
+          if (zmq_manager->ConsumePoseEntry()) {
+            pose_entry_requested_.store(true);
+          }
+          if (zmq_manager->ConsumePoseExit()) {
+            pose_exit_requested_.store(true);
+          }
+        }
       }
 
       if (playback_input_file_ && program_state_ == ProgramState::CONTROL) {
@@ -3836,7 +4466,17 @@ class G1Deploy {
 
       switch (program_state_) {
         case ProgramState::INIT:
-          if (!InitControl()) {
+          if (warm_handoff_enabled_) {
+            if (!CheckSafety()) {
+              static int wait_count = 0;
+              if (wait_count++ % 10 == 0) {
+                std::cout << "[ControlHandoff] Waiting for fresh LowState data."
+                          << std::endl;
+              }
+              break;
+            }
+            RunUserCtrlEntry();
+          } else if (!InitControl()) {
             std::cout << "LowState is not available, waiting for robot to be ready" << std::endl;
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
           }
@@ -3876,6 +4516,8 @@ class G1Deploy {
             operator_state.stop = true;
             break;
           }
+
+          if (warm_handoff_enabled_ && RunUserCtrlReturn()) { break; }
 
           // NEW: Get data with timestamps for loop timing analysis
           auto obs_start_time = std::chrono::steady_clock::now();
@@ -3983,6 +4625,20 @@ class G1Deploy {
             return;
           }
           auto motor_command_end_time = std::chrono::steady_clock::now();
+          if (pose_entry_requested_.load() && current_motion_copy &&
+              current_motion_copy->name == "streamed") {
+            const auto command = motor_command_buffer_.GetDataWithTime().data;
+            if (command && userctrl_handoff_.TryCaptureReturnReference(
+                               command->q_target, motor_command_end_time)) {
+              pose_entry_requested_.store(false);
+              return_entry_pose_logged_ = false;
+            } else if (userctrl_handoff_.has_return_reference()) {
+              pose_entry_requested_.store(false);
+              std::cout << "[ControlHandoff] POSE return reference already captured; "
+                           "keeping the first reference for this session."
+                        << std::endl;
+            }
+          }
 
           // Update Dex3 hands max close ratio from keyboard-controlled value (X/C keys)
           dex3_hands_.SetMaxCloseRatio(input_interface_->GetMaxCloseRatio());
@@ -4209,7 +4865,8 @@ int main(int argc, char const* argv[]) {
   std::string plannerFile = "";
 
   // Parse optional arguments
-  bool disableCrcCheck = false;\
+  bool disableCrcCheck = false;
+  bool warmHandoff = false;
   std::string obsConfigPath = "";
   std::string encoderFile = "";
   std::string targetMotionLogfile = "";
@@ -4476,6 +5133,12 @@ int main(int argc, char const* argv[]) {
     }
   }
 
+  warmHandoff = ShouldEnableManagedHandoff(inputType, disableCrcCheck);
+  std::cout << "[INFO] Body-control ownership handoff "
+            << (warmHandoff ? "enabled for real zmq_manager input"
+                            : "disabled")
+            << std::endl;
+
   std::cout << "[DEBUG] Creating G1Deploy object..." << std::endl;
   G1Deploy custom(
     networkInterface,
@@ -4506,7 +5169,8 @@ int main(int argc, char const* argv[]) {
     enableMotionRecording,
     initial_compliance,
     initial_max_close_ratio,
-    motor_gain_scales
+    motor_gain_scales,
+    warmHandoff
   );
   std::cout << "[DEBUG] G1Deploy object created successfully!" << std::endl;
   
@@ -4531,5 +5195,15 @@ int main(int argc, char const* argv[]) {
   std::cout << "[DEBUG] Waiting for cleanup..." << std::endl;
   sleep(0.5);
   std::cout << "[DEBUG] Program exiting normally..." << std::endl;
+
+  if (ShouldBypassDdsDestructors(
+          warmHandoff, custom.ReturnedToInternalControl())) {
+    std::cout << "[DEBUG] Skipping CycloneDDS 0.10.2 entity destructors after "
+                 "confirmed WALKRUN return."
+              << std::endl;
+    std::cout.flush();
+    std::cerr.flush();
+    std::quick_exit(EXIT_SUCCESS);
+  }
   return 0;
 }
