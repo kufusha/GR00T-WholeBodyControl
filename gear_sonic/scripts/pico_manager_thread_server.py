@@ -47,6 +47,66 @@ from gear_sonic.trl.utils.torch_transform import (
     quaternion_to_rotation_matrix,
 )
 
+
+class _ManagerControlAction(Enum):
+    NONE = 1
+    START = 2
+    GUARDED_STOP = 3
+
+
+class _ManagerControlGesture:
+    def __init__(self):
+        self._previously_pressed = False
+
+    def update(self, *, pressed: bool, control_active: bool):
+        rising_edge = pressed and not self._previously_pressed
+        self._previously_pressed = pressed
+        if not rising_edge:
+            return _ManagerControlAction.NONE
+        if control_active:
+            return _ManagerControlAction.GUARDED_STOP
+        return _ManagerControlAction.START
+
+
+class _GuardedStopLatch:
+    def __init__(self):
+        self._pending = False
+
+    @property
+    def streaming_enabled(self) -> bool:
+        return not self._pending
+
+    def request(self) -> bool:
+        if self._pending:
+            return False
+        self._pending = True
+        return True
+
+
+def _decode_handoff_status(payload: bytes):
+    try:
+        return msgpack.unpackb(payload, raw=False)
+    except (ValueError, TypeError, msgpack.ExtraData):
+        return None
+
+
+def _is_walkrun_return_confirmed(payload: bytes) -> bool:
+    status = _decode_handoff_status(payload)
+    return (
+        isinstance(status, dict)
+        and status.get("event") == "walkrun_return_confirmed"
+        and status.get("fsm_id") == 801
+    )
+
+
+def _is_emergency_stop_requested(payload: bytes) -> bool:
+    status = _decode_handoff_status(payload)
+    return (
+        isinstance(status, dict)
+        and status.get("event") == "emergency_stop_requested"
+        and status.get("fsm_id") == 1
+    )
+
 try:
     from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
         build_command_message,
@@ -130,6 +190,57 @@ class StreamMode(Enum):
     PLANNER_FROZEN_UPPER_BODY = 3
     POSE_PAUSE = 4
     PLANNER_VR_3PT = 5
+
+
+_POSE_ENTRY_MAX_DATA_AGE, _POSE_ENTRY_MAX_DQ = 0.1, 0.15  # 100 ms, 0.15 rad/s
+
+def _check_pose_entry(sample, feedback, three_point, now: float):
+    if not three_point.is_calibrated or three_point.is_pending or sample is None or any(value is None for value in (three_point._calibration_lwrist_offset, three_point._calibration_rwrist_offset, three_point._calibration_lwrist_rot_offset, three_point._calibration_rwrist_rot_offset)):
+        return False, "Pico pose is not fully calibrated or unavailable"
+    try:
+        robot_feedback = feedback.pose_entry_feedback
+        body, q, dq, base_quat = (np.asarray(value, dtype=np.float64) for value in (sample["body_poses_np"], *robot_feedback[:3]))
+        ages = (now - float(sample["timestamp_monotonic"]), now - robot_feedback[3])
+        if (body.shape, q.shape, dq.shape, base_quat.shape) != ((24, 7), (29,), (29,), (4,)) or not all(np.all(np.isfinite(x)) for x in (body, q, dq, base_quat)):
+            return False, "Pico or robot feedback is invalid"
+        if not all(np.isfinite(ages)) or min(ages) < 0.0 or max(ages) > _POSE_ENTRY_MAX_DATA_AGE:
+            return False, f"Pico or robot feedback is stale ({max(ages) * 1000.0:.0f} ms)"
+        if float(np.max(np.abs(dq))) > _POSE_ENTRY_MAX_DQ:
+            return False, f"robot joint speed is too high ({np.max(np.abs(dq)):.3f} rad/s)"
+        frames = ("pelvis", "torso_link", "left_hip_pitch_link", "right_hip_pitch_link", "left_knee_link", "right_knee_link", "left_ankle_roll_link", "right_ankle_roll_link", "left_shoulder_roll_link", "right_shoulder_roll_link", "left_elbow_link", "right_elbow_link", "left_wrist_roll_link", "right_wrist_roll_link")
+        human = np.array([_compute_rel_transform(p.copy(), body[0].copy(), False)[0] for p in body])
+        three_point._robot_model.cache_forward_kinematics(robot_q := three_point._robot_model.get_configuration_from_actuated_joints(body_actuated_joint_values=q), auto_clip=False)
+        robot = np.array([three_point._robot_model.frame_placement(name).translation for name in frames])
+        robot -= robot[0]
+        def angle(a, b): return np.arccos(np.clip(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)), -1.0, 1.0))
+        human_up, robot_up = (sRot.from_quat(x, scalar_first=True).apply([0, 0, 1]) for x in (_compute_rel_transform(body[0].copy(), np.array([0, 0, 0, 0, 0, 0, 1.0]), False)[1], base_quat))
+        for label, difference, limit in (("torso", angle(human_up, robot_up), 20), ("torso", angle(human[12], robot[1]), 20),
+                  ("left hip", angle(human[1]-human[4], robot[2]-robot[4]), 25), ("right hip", angle(human[2]-human[5], robot[3]-robot[5]), 25),
+                  ("left knee", abs(angle(human[1]-human[4], human[7]-human[4]) - angle(robot[2]-robot[4], robot[6]-robot[4])), 25), ("right knee", abs(angle(human[2]-human[5], human[8]-human[5]) - angle(robot[3]-robot[5], robot[7]-robot[5])), 25)):
+            if not np.isfinite(difference) or difference > np.deg2rad(limit): return False, f"{label} pose mismatch ({np.rad2deg(difference):.0f} deg, limit={limit} deg)"
+        human_leg, robot_leg = (sum(np.linalg.norm(human[i] - human[i + 6]) for i in (1, 2)) / 2, sum(np.linalg.norm(robot[i] - robot[i + 4]) for i in (2, 3)) / 2)
+        if abs((human[7, 2] - human[8, 2]) * robot_leg / max(human_leg, 1e-8) - (robot[6, 2] - robot[7, 2])) > 0.10: return False, "foot height mismatch"
+        pico_wrists, g1_wrists = three_point._apply_calibration(_process_3pt_pose(body))[:2], get_g1_key_frame_poses(three_point._robot_model, q=robot_q)
+        for i, side in enumerate(("left", "right")):
+            g1_wrist = g1_wrists[f"{side}_wrist"]
+            position_error = np.linalg.norm(pico_wrists[i, :3] - g1_wrist["position"])
+            rotation_error = (sRot.from_quat(pico_wrists[i, 3:], scalar_first=True).inv() * sRot.from_quat(g1_wrist["orientation_wxyz"], scalar_first=True)).magnitude()
+            if position_error > 0.35 or rotation_error > np.deg2rad(60): return False, f"{side} wrist mismatch ({position_error:.2f} m, {np.rad2deg(rotation_error):.0f} deg)"
+        arm_state = []
+        for human_ids, robot_ids in (((16, 18, 20), (8, 10, 12)), ((17, 19, 21), (9, 11, 13))):
+            hs, he, hw = human[list(human_ids)]
+            rs, re, rw = robot[list(robot_ids)]
+            arm_state.append((angle(he-hs, re-rs), angle(hs-he, hw-he) - angle(rs-re, rw-re)))
+        arm_state = np.asarray(arm_state)
+        if (reference := getattr(three_point, "_pose_entry_arm_reference", None)) is None: three_point._pose_entry_arm_reference = arm_state
+        else:
+            errors = np.abs(arm_state - reference)
+            if not np.all(np.isfinite(errors)) or np.max(errors) > np.deg2rad(45):
+                side = ("left", "right")[np.unravel_index(np.argmax(errors), errors.shape)[0]]
+                return False, f"{side} arm motion mismatch ({np.rad2deg(np.max(errors)):.0f} deg)"
+    except (AttributeError, KeyError, RuntimeError, TypeError, ValueError) as error:
+        return False, f"pose calculation failed: {error}"
+    return True, "pose compatible"
 
 
 ### Parse 3 point pose from SMPL
@@ -1079,14 +1190,15 @@ class ThreePointPose:
             except Exception as e:
                 print(f"[{self.log_prefix}] Warning: Error closing VR3pt visualizer: {e}")
 
-    def calibrate_now(self, body_poses_np: np.ndarray) -> bool:
-        """Calibrate using current SMPL frame against FK of all-zero body joints.
-        Operator should be in zero-reference pose when calling this."""
+    def calibrate_now(self, body_poses_np: np.ndarray, body_q_measured: np.ndarray) -> bool:
+        """Calibrate the current SMPL frame against measured G1 joints."""
         try:
             vr_3pt_pose_raw = _process_3pt_pose(body_poses_np)
-            self._override_robot_q = np.zeros(29, dtype=np.float64)
+            self._override_robot_q = np.asarray(body_q_measured, dtype=np.float64)
+            if self._override_robot_q.shape != (29,) or not np.all(np.isfinite(self._override_robot_q)): raise ValueError("invalid measured G1 joints")
             self._capture_calibration(vr_3pt_pose_raw)
-            print(f"[{self.log_prefix}] Calibration completed (zero-pose reference)")
+            self._pose_entry_arm_reference = None
+            print(f"[{self.log_prefix}] Calibration completed (measured G1 reference)")
             return True
         except Exception as e:
             print(f"[{self.log_prefix}] Calibration failed: {e}")
@@ -1651,6 +1763,7 @@ class FeedbackReader:
 
     def __init__(self, zmq_feedback_host: str = "localhost", zmq_feedback_port: int = 5557):
         self.poller = ZMQPoller(host=zmq_feedback_host, port=zmq_feedback_port, topic="g1_debug")
+        self.pose_entry_poller = ZMQPoller(host=zmq_feedback_host, port=zmq_feedback_port, topic="g1_debug")
 
         self.upper_body_joint_indices = self._get_upper_body_joint_indices()
 
@@ -1660,6 +1773,7 @@ class FeedbackReader:
         # Full body joint configuration (29 DOFs) as measured from robot,
         # used for FK when recalibrating VR 3PT tracking against actual robot pose
         self.full_body_q_measured: np.ndarray | None = None
+        self.pose_entry_feedback = None
 
     def _get_upper_body_joint_indices(self) -> list[int]:
         # TODO: get from robot model, not hardcoded
@@ -1709,6 +1823,14 @@ class FeedbackReader:
             right_hand_q = None
 
         return body_q, left_hand_q, right_hand_q, full_body_q
+
+    def refresh_pose_entry_feedback(self):
+        if not self.pose_entry_poller._socket.poll(timeout=0): return
+        try:
+            unpacked = msgpack.unpackb(self.pose_entry_poller.get_data(), raw=False)
+            self.pose_entry_feedback = (*(unpacked[key] for key in ("body_q_measured", "body_dq", "base_quat")), time.monotonic())
+        except (IndexError, KeyError, TypeError, ValueError, msgpack.exceptions.ExtraData):
+            self.pose_entry_feedback = None
 
 
 class PlannerStreamer:
@@ -1917,13 +2039,20 @@ def run_pico_manager(
     Manager: creates shared PUB socket and runs pose/planner streamers based on current mode.
     Controller input:
       A+X: Toggle between planner and pose mode
-      A+B+X+Y: Toggle policy start/stop
+      A+B+X+Y: Start from OFF or request the unified guarded stop
     """
     reader = _init_input_source(input_source, buffer_size)
 
     context = zmq.Context()
     socket = context.socket(zmq.PUB)
     socket.bind(f"tcp://*:{port}")
+    handoff_status_topic = b"handoff_status"
+    handoff_status_socket = context.socket(zmq.SUB)
+    handoff_status_socket.setsockopt(zmq.SUBSCRIBE, handoff_status_topic)
+    handoff_status_socket.setsockopt(zmq.CONFLATE, 1)
+    handoff_status_socket.connect(
+        f"tcp://{zmq_feedback_host}:{zmq_feedback_port}"
+    )
     time.sleep(0.1)
     print(f"[Manager] ZMQ socket bound to port {port}")
 
@@ -1975,22 +2104,54 @@ def run_pico_manager(
     #                                                        |
     #                                                   (ax)--> POSE
     #
-    #   Emergency stop from any mode: A+B+X+Y (start_combo) --> OFF
+    #   Unified control: A+B+X+Y starts from OFF or requests guarded stop.
     #   POSE_PAUSE: left_menu_button held --> POSE_PAUSE, released --> POSE
     #
-    print("Manager controls: A+X=toggle mode, A+B+X+Y=start/stop policy")
+    print(
+        "Manager controls: A+X=toggle mode, "
+        "A+B+X+Y=start/guarded stop"
+    )
     current_mode = StreamMode.OFF
     # Track which mode VR_3PT was entered from, so left_axis_click returns to it.
     # Will be either PLANNER or PLANNER_FROZEN_UPPER_BODY.
     vr3pt_parent_mode = StreamMode.PLANNER
     prev_toggle_dc = False
     prev_toggle_da = False
+    control_gesture = _ManagerControlGesture()
+    guarded_stop_latch = _GuardedStopLatch()
     try:
         prev_ax_pressed = False
         prev_by_pressed = False
-        prev_start_combo = False
         prev_left_axis_click = False
         while True:
+            planner_streamer.feedback_reader.refresh_pose_entry_feedback()
+            try:
+                status_message = handoff_status_socket.recv(zmq.NOBLOCK)
+            except zmq.Again:
+                status_message = None
+
+            if status_message is not None:
+                status_payload = status_message[len(handoff_status_topic) :]
+                if _is_walkrun_return_confirmed(status_payload):
+                    print(
+                        "[Manager] WALKRUN return confirmed; stopping streams "
+                        "and closing ZMQ port 5556."
+                    )
+                    break
+                if _is_emergency_stop_requested(status_payload):
+                    print(
+                        "[Manager] Deploy requested emergency stop; using the "
+                        "existing OFF shutdown path."
+                    )
+                    socket.send(
+                        build_command_message(
+                            start=False,
+                            stop=True,
+                            planner=True,
+                        )
+                    )
+                    break
+
             # Poll Pico controller for buttons/axes
             a_pressed, b_pressed, x_pressed, y_pressed = get_abxy_buttons(reader)
 
@@ -2004,34 +2165,57 @@ def run_pico_manager(
             # Rising edge: B+Y pressed together -> toggle POSE/PLANNER_FROZEN_UPPER_BODY mode
             by_pressed = (b_pressed) and (y_pressed)
 
-            # Rising edge: A+B+X+Y pressed together -> toggle policy start/stop (planner=True)
+            # A+B+X+Y starts from OFF or requests the unified guarded stop.
             start_combo = (a_pressed) and (b_pressed) and (x_pressed) and (y_pressed)
+            control_action = control_gesture.update(
+                pressed=start_combo,
+                control_active=current_mode != StreamMode.OFF,
+            )
+            if (
+                control_action == _ManagerControlAction.GUARDED_STOP
+                and guarded_stop_latch.request()
+            ):
+                planner_enabled = current_mode in (
+                    StreamMode.PLANNER,
+                    StreamMode.PLANNER_FROZEN_UPPER_BODY,
+                    StreamMode.PLANNER_VR_3PT,
+                )
+                socket.send(
+                    build_command_message(
+                        start=False,
+                        stop=True,
+                        planner=planner_enabled,
+                    )
+                )
+                print(
+                    "[Manager] Unified guarded stop requested; "
+                    "teleoperation streaming is paused while waiting for "
+                    "deploy status."
+                )
+
+            if not guarded_stop_latch.streaming_enabled:
+                time.sleep(0.01)
+                continue
 
             new_mode = current_mode
             if current_mode == StreamMode.OFF:
-                if start_combo and not prev_start_combo:
-                    new_mode = StreamMode.PLANNER
-                    # Calibrate VR 3pt tracking NOW: operator should be in zero-ref pose.
-                    # Uses the current Pico SMPL frame + FK of all-zero body joints.
-                    sample = reader.get_latest()
-                    if sample is not None:
-                        three_point.calibrate_now(sample["body_poses_np"])
-                    else:
-                        print("[Manager] WARNING: No SMPL data available for calibration")
+                if control_action == _ManagerControlAction.START:
+                    if (sample := reader.get_latest()) is not None:
+                        three_point._pose_entry_calibration = (sample["body_poses_np"].copy(), time.monotonic() + 1.0)
+                        new_mode = StreamMode.PLANNER
 
             elif current_mode == StreamMode.PLANNER:
+                reference, feedback = getattr(three_point, "_pose_entry_calibration", None), planner_streamer.feedback_reader.pose_entry_feedback
+                if not three_point.is_calibrated and reference is not None and time.monotonic() >= reference[1] and feedback is not None and time.monotonic() - feedback[3] <= _POSE_ENTRY_MAX_DATA_AGE and np.max(np.abs(feedback[1])) <= _POSE_ENTRY_MAX_DQ:
+                    if three_point.calibrate_now(reference[0], feedback[0]): _check_pose_entry({"body_poses_np": reference[0], "timestamp_monotonic": time.monotonic()}, planner_streamer.feedback_reader, three_point, time.monotonic())
                 # Chain 2: POSE <--(ax)--> PLANNER <--(left_axis_click)--> VR_3PT
-                if start_combo and not prev_start_combo:
-                    new_mode = StreamMode.OFF
-                elif ax_pressed and not prev_ax_pressed:
+                if ax_pressed and not prev_ax_pressed:
                     new_mode = StreamMode.POSE
                 elif left_axis_click and not prev_left_axis_click:
                     new_mode = StreamMode.PLANNER_VR_3PT
 
             elif current_mode == StreamMode.POSE:
-                if start_combo and not prev_start_combo:
-                    new_mode = StreamMode.OFF
-                elif ax_pressed and not prev_ax_pressed:
+                if ax_pressed and not prev_ax_pressed:
                     new_mode = StreamMode.PLANNER  # Enter chain 2
                 elif by_pressed and not prev_by_pressed:
                     new_mode = StreamMode.PLANNER_FROZEN_UPPER_BODY  # Enter chain 1
@@ -2040,17 +2224,13 @@ def run_pico_manager(
 
             elif current_mode == StreamMode.PLANNER_FROZEN_UPPER_BODY:
                 # Chain 1: POSE <--(by)--> FROZEN <--(left_axis_click)--> VR_3PT
-                if start_combo and not prev_start_combo:
-                    new_mode = StreamMode.OFF
-                elif by_pressed and not prev_by_pressed:
+                if by_pressed and not prev_by_pressed:
                     new_mode = StreamMode.POSE
                 elif left_axis_click and not prev_left_axis_click:
                     new_mode = StreamMode.PLANNER_VR_3PT
 
             elif current_mode == StreamMode.POSE_PAUSE:
-                if start_combo and not prev_start_combo:
-                    new_mode = StreamMode.OFF
-                elif not left_menu_button:
+                if not left_menu_button:
                     new_mode = StreamMode.POSE
 
             elif current_mode == StreamMode.PLANNER_VR_3PT:
@@ -2058,15 +2238,18 @@ def run_pico_manager(
                 #   left_axis_click → return to parent (PLANNER or FROZEN)
                 #   ax_pressed      → POSE (chain 2 exit)
                 #   by_pressed      → POSE (chain 1 exit)
-                if start_combo and not prev_start_combo:
-                    new_mode = StreamMode.OFF
-                elif left_axis_click and not prev_left_axis_click:
+                if left_axis_click and not prev_left_axis_click:
                     new_mode = vr3pt_parent_mode  # Return to parent mode
                 elif ax_pressed and not prev_ax_pressed:
                     new_mode = StreamMode.POSE
                 elif by_pressed and not prev_by_pressed:
                     new_mode = StreamMode.POSE
 
+            if new_mode == StreamMode.POSE and current_mode not in (StreamMode.POSE, StreamMode.POSE_PAUSE):
+                safe, reason = _check_pose_entry(reader.get_latest(), planner_streamer.feedback_reader, three_point, time.monotonic())
+                if not safe:
+                    new_mode = current_mode
+                print(f"[PoseEntryGuard] POSE entry {'accepted' if safe else 'rejected: ' + reason}.")
             # Handle mode transitions before running loop
             if new_mode != current_mode:
                 if current_mode == StreamMode.POSE:
@@ -2143,7 +2326,6 @@ def run_pico_manager(
 
             prev_ax_pressed = ax_pressed
             prev_by_pressed = by_pressed
-            prev_start_combo = start_combo
             prev_left_axis_click = left_axis_click
 
     except KeyboardInterrupt:
@@ -2152,6 +2334,7 @@ def run_pico_manager(
         # Cleanup resources
         reader.stop()
         three_point.close()
+        handoff_status_socket.close()
         socket.close()
         context.term()
         print("[Manager] Shutdown complete")

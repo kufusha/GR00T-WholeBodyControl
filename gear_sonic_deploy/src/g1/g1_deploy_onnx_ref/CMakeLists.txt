@@ -183,6 +183,7 @@ set(EXE_INCLUDES
 # Build a static library, used by both the main executable and the tests: 
 add_library(g1_deploy_shared STATIC ${PROJECT_SRCS})
 target_include_directories(g1_deploy_shared PUBLIC ${EXE_INCLUDES})
+target_link_libraries(g1_deploy_shared PUBLIC unitree_sdk2)
 
 # List of libs to link for both the main executable and the tests
 set(EXE_LIBS

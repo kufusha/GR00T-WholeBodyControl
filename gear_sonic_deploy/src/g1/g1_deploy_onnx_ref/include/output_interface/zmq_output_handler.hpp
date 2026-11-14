@@ -111,6 +111,7 @@
 #include <msgpack.hpp>
 
 #include "output_interface.hpp"
+#include "../managed_handoff.hpp"
 #include "../policy_parameters.hpp"  // For isaaclab_to_mujoco, default_angles, g1_action_scale
 #include "../robot_parameters.hpp"   // For HeadingState
 #include "../utils.hpp"              // For DataBuffer
@@ -229,12 +230,34 @@ public:
         }
     }
 
+    void publish_walkrun_return_confirmed() {
+        const auto status = MakeWalkrunReturnConfirmedStatus();
+        publish_handoff_status(status);
+    }
+
+    void publish_emergency_stop_requested() {
+        const auto status = MakeEmergencyStopRequestedStatus();
+        publish_handoff_status(status);
+    }
+
 private:
+    void publish_handoff_status(const HandoffStatus& status) {
+        msgpack::sbuffer payload;
+        msgpack::packer<msgpack::sbuffer> packer(&payload);
+        packer.pack_map(2);
+        packer.pack("event");
+        packer.pack(std::string(status.event));
+        packer.pack("fsm_id");
+        packer.pack(status.fsm_id);
+        send_zmq_message(handoff_status_topic_, payload);
+    }
+
     zmq::context_t realtime_debug_context_;                ///< ZMQ context (1 I/O thread).
     std::unique_ptr<zmq::socket_t> realtime_debug_socket_; ///< ZMQ PUB socket.
 
     std::string topic_;              ///< User-provided topic name (e.g. "g1_debug") for combined state+viz.
     std::string robot_config_topic_; ///< Topic for robot config messages.
+    std::string handoff_status_topic_ = "handoff_status";
 
     msgpack::sbuffer state_data_sbuf_;  ///< Reused each tick; cleared in pack_combined_state().
 
