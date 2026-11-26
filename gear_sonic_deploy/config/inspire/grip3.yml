@@ -1,0 +1,65 @@
+# 片手ごとの6軸目標。屈曲は 1 = 開、0 = 閉。thumb_rotate は根元の回転位置（0～1）。
+# grip はPICOの握り込み量（0～1）。各点の間は線形補間します。
+# 実機確認済みの3指把持。グリップ量で親指屈曲・人差し指・中指を動かします。
+name: grip3
+points:
+  - grip: 0.0
+    left:
+      pinky: 1.0
+      ring: 1.0
+      middle: 1.0
+      index: 1.0
+      thumb_bend: 1.0
+      thumb_rotate: 0.0
+    right:
+      pinky: 1.0
+      ring: 1.0
+      middle: 1.0
+      index: 1.0
+      thumb_bend: 1.0
+      thumb_rotate: 0.0
+  - grip: 0.2
+    left:
+      pinky: 0.25
+      ring: 0.25
+      middle: 0.75
+      index: 0.75
+      thumb_bend: 0.75
+      thumb_rotate: 0.0
+    right:
+      pinky: 0.25
+      ring: 0.25
+      middle: 0.75
+      index: 0.75
+      thumb_bend: 0.75
+      thumb_rotate: 0.0
+  - grip: 0.8
+    left:
+      pinky: 0.25
+      ring: 0.25
+      middle: 0.658255607237736
+      index: 0.658255607237736
+      thumb_bend: 0.4253988176589613
+      thumb_rotate: 0.0
+    right:
+      pinky: 0.25
+      ring: 0.25
+      middle: 0.658255607237736
+      index: 0.658255607237736
+      thumb_bend: 0.4253988176589613
+      thumb_rotate: 0.0
+  - grip: 1.0
+    left:
+      pinky: 0.25
+      ring: 0.25
+      middle: 0.608255607237736
+      index: 0.608255607237736
+      thumb_bend: 0.3753988176589613
+      thumb_rotate: 0.0
+    right:
+      pinky: 0.25
+      ring: 0.25
+      middle: 0.608255607237736
+      index: 0.608255607237736
+      thumb_bend: 0.3753988176589613
+      thumb_rotate: 0.0

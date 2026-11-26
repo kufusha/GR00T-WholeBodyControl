@@ -133,8 +133,8 @@
 // Control policy
 #include "../include/control_policy.hpp"
 
-// Dex3 hands
-#include "../include/dex3_hands.hpp"
+// Inspire hands
+#include "../include/inspire_hands.hpp"
 
 // Error monitor
 #include "../include/error_monitor.hpp"
@@ -157,7 +157,7 @@ using namespace unitree_hg::msg::dds_;
  *  - PolicyEngine (TensorRT control policy)
  *  - EncoderEngine (optional TensorRT observation encoder)
  *  - LocalMotionPlannerBase (optional TensorRT locomotion planner)
- *  - Dex3Hands (optional Dex3 hand controller)
+ *  - InspireHands (optional Inspire hand controller)
  *  - StateLogger (ring buffer + CSV persistence)
  *  - OutputInterface(s) (ZMQ / ROS2 state publishers)
  *  - MotionDataReader (pre-loaded reference motions)
@@ -281,8 +281,8 @@ class G1Deploy {
     // =========================================================================
     std::unique_ptr<unitree::robot::b2::MotionSwitcherClient> msc_;
     
-    // Dex3 hands manager
-    Dex3Hands dex3_hands_;
+    // Inspire hands manager
+    InspireHands inspire_hands_;
 
     // Motor error monitor (tracks fault state transitions)
     ErrorMonitor error_monitor_;
@@ -323,7 +323,7 @@ class G1Deploy {
     // =========================================================================
     std::array<double, 3> initial_vr_3point_compliance_ = {0.5, 0.5, 0.0};
     
-    // Initial max close ratio for Dex3 hands (set from command line)
+    // Initial max close ratio for Inspire hands (set from command line)
     // Default 1.0 allows full closure, use --max-close-ratio to limit
     // Keyboard controls (J/K) always available for runtime adjustment
     double initial_max_close_ratio_ = 1.0;
@@ -2217,8 +2217,8 @@ class G1Deploy {
       // Initialize ChannelFactory
       ChannelFactory::Instance()->Init(0, networkInterface);
 
-      // Initialize Dex3 hands (ChannelFactory already initialized above)
-      dex3_hands_.initialize("");
+      // Initialize Inspire hands (ChannelFactory already initialized above)
+      inspire_hands_.initialize("");
 
       audio_thread_ = std::make_unique<AudioThread>();
 
@@ -2551,7 +2551,7 @@ class G1Deploy {
         input_interface_->SetVR3PointCompliance(initial_vr_3point_compliance_);
         // Set initial max close ratio for hands (keyboard-controlled: X/C keys)
         input_interface_->SetMaxCloseRatio(initial_max_close_ratio_);
-        dex3_hands_.SetMaxCloseRatio(initial_max_close_ratio_);
+        inspire_hands_.SetMaxCloseRatio(initial_max_close_ratio_);
         std::cout << "[INFO] Initial VR 3-point compliance: ["
                   << initial_vr_3point_compliance_[0] << ", "
                   << initial_vr_3point_compliance_[1] << ", "
@@ -2689,7 +2689,7 @@ class G1Deploy {
      *
      * Reads the latest MotorCommand from motor_command_buffer_, packs it
      * into a LowCmd_ DDS message with CRC, and publishes via DDS.
-     * Also publishes Dex3 hand commands at the same cadence.
+     * Also publishes Inspire hand commands at the same cadence.
      */
     void LowCommandWriter() {
       LowCmd_ dds_low_command;
@@ -2711,8 +2711,8 @@ class G1Deploy {
         lowcmd_publisher_->Write(dds_low_command);
       }
 
-      // Publish Dex3 hand commands at the same publish cadence
-      dex3_hands_.writeOnce();
+      // Publish Inspire hand commands at the same publish cadence
+      inspire_hands_.writeOnce();
     }
 
     /// Gracefully stop all threads and send a damping-only command.
@@ -2756,7 +2756,7 @@ class G1Deploy {
      *        default standing angles over `duration_` seconds (linear interpolation).
      *
      * Called at 50 Hz until the ramp completes, at which point the state machine
-     * transitions to WAIT_FOR_CONTROL and the Dex3 hands open.
+     * transitions to WAIT_FOR_CONTROL and the Inspire hands open.
      * @return True once LowState data is available; false if not yet ready.
      */
     bool InitControl() {
@@ -2781,12 +2781,12 @@ class G1Deploy {
           motor_command_tmp.q_target.at(i) =
               static_cast<float>(current_pos * (1.0 - ratio) + default_angles[i] * ratio);
         }
-        dex3_hands_.close(true);
-        dex3_hands_.close(false);
+        inspire_hands_.close(true);
+        inspire_hands_.close(false);
       } else {
         program_state_ = ProgramState::WAIT_FOR_CONTROL;
-        dex3_hands_.open(true);
-        dex3_hands_.open(false);
+        inspire_hands_.open(true);
+        inspire_hands_.open(false);
         std::cout << "Init Done" << std::endl;
       }
       motor_command_buffer_.SetData(motor_command_tmp);
@@ -2933,27 +2933,11 @@ class G1Deploy {
       std::array<double, 3> body_torso_ang_vel = float_to_double<3>(imu_torso->gyroscope());
       std::array<double, 3> body_torso_accel = float_to_double<3>(imu_torso->accelerometer());
 
-      // Collect hand states from Dex3 hands
-      std::array<double, 7> left_hand_q = {0.0};
-      std::array<double, 7> left_hand_dq = {0.0};
-      std::array<double, 7> right_hand_q = {0.0};
-      std::array<double, 7> right_hand_dq = {0.0};
-      
-      auto left_hand_state_ptr = dex3_hands_.getState(true);
-      if (left_hand_state_ptr) {
-        for (int i = 0; i < 7; ++i) {
-          left_hand_q[i] = left_hand_state_ptr->motor_state()[i].q();
-          left_hand_dq[i] = left_hand_state_ptr->motor_state()[i].dq();
-        }
-      }
-      
-      auto right_hand_state_ptr = dex3_hands_.getState(false);
-      if (right_hand_state_ptr) {
-        for (int i = 0; i < 7; ++i) {
-          right_hand_q[i] = right_hand_state_ptr->motor_state()[i].q();
-          right_hand_dq[i] = right_hand_state_ptr->motor_state()[i].dq();
-        }
-      }
+      // SONIC's legacy 7-axis fields echo the hand targets. Measured Inspire
+      // positions are the separate 12-axis rt/inspire/state stream.
+      auto left_hand_q = inspire_hands_.getCompatibleState(true);
+      auto right_hand_q = inspire_hands_.getCompatibleState(false);
+      std::array<double, 7> left_hand_dq{}, right_hand_dq{};
 
       // Log robot state for analysis and debugging
       if (state_logger_) {
@@ -3825,7 +3809,7 @@ class G1Deploy {
      *    3. GatherObservations — fill the policy observation vector.
      *    4. LogPostState — append encoder token to the latest log entry.
      *    5. CreatePolicyCommand — run TensorRT policy, produce MotorCommand.
-     *    6. Update Dex3 hands (max-close ratio + joint targets).
+     *    6. Update Inspire hands (max-close ratio + joint targets).
      *    7. Publish state to all output interfaces (ZMQ / ROS2).
      *    8. Handle motion recording (streamed + planner).
      *    9. CurrentFrameAdvancement — advance playback cursor, blend planner.
@@ -3984,12 +3968,12 @@ class G1Deploy {
           }
           auto motor_command_end_time = std::chrono::steady_clock::now();
 
-          // Update Dex3 hands max close ratio from keyboard-controlled value (X/C keys)
-          dex3_hands_.SetMaxCloseRatio(input_interface_->GetMaxCloseRatio());
+          // Update Inspire hands max close ratio from keyboard-controlled value (X/C keys)
+          inspire_hands_.SetMaxCloseRatio(input_interface_->GetMaxCloseRatio());
           
           // set hand poses (use buffered data for consistency)
-          dex3_hands_.setAllJointsCommand(true, left_hand_joint_buffer_);
-          dex3_hands_.setAllJointsCommand(false, right_hand_joint_buffer_);
+          inspire_hands_.setAllJointsCommand(true, left_hand_joint_buffer_);
+          inspire_hands_.setAllJointsCommand(false, right_hand_joint_buffer_);
           
           // Update last hand actions for logging (use buffered data)
           for (int i = 0; i < 7; ++i) {
@@ -4106,7 +4090,7 @@ class G1Deploy {
             }
             
             // Print hand max close ratio (keyboard-controlled via X/C keys)
-            std::cout << " | HandCloseRatio: " << dex3_hands_.GetMaxCloseRatio();
+            std::cout << " | HandCloseRatio: " << inspire_hands_.GetMaxCloseRatio();
             
             std::cout << std::endl;
           }
@@ -4144,7 +4128,7 @@ static bool parse_motor_gain_scale_flag(
  * All other arguments are optional flags (see --help for full list).
  * The main loop sleeps until the operator issues a stop signal or ROS2 shuts down.
  */
-int main(int argc, char const* argv[]) {
+int main(int argc, char const* argv[]) try {
   std::cout << "[DEBUG] Program starting..." << std::endl;
   if (argc < 4) {
     std::cout << "Usage: " << argv[0] << " <network_interface> <policy_file> <motion_data_path> [OPTIONS]"
@@ -4532,4 +4516,7 @@ int main(int argc, char const* argv[]) {
   sleep(0.5);
   std::cout << "[DEBUG] Program exiting normally..." << std::endl;
   return 0;
+} catch (const inspire_grip::ProfileError& error) {
+  std::cerr << error.what() << '\n';
+  return 1;
 }

@@ -198,12 +198,13 @@ set(EXE_LIBS
 
 
 # build the main executable:
+find_package(yaml-cpp CONFIG REQUIRED)
 add_executable(${EXECUTABLE_NAME} ${CMAKE_CURRENT_SOURCE_DIR}/src/g1_deploy_onnx_ref.cpp)
 target_include_directories(${EXECUTABLE_NAME} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include/ ${PROJECT_SOURCE_DIR}/src)
 
 target_link_directories(${EXECUTABLE_NAME} PRIVATE ${CUDA_LINK_DIRS})
 target_link_libraries(
-  ${EXECUTABLE_NAME} PRIVATE ${PROJECT_NAME}
+  ${EXECUTABLE_NAME} PRIVATE ${PROJECT_NAME} ${YAML_CPP_LIBRARIES}
   ${EXE_LIBS}
 )
 
