@@ -503,12 +503,9 @@ def generate_finger_data(hand: str, trigger: float, grip: float) -> np.ndarray:
     """
     fingertips = np.zeros([25, 4, 4])
 
-    thumb = 0
-    middle = 10
-    # Control thumb based on shoulder button state (index 4 is thumb tip)
-    fingertips[4 + thumb, 0, 3] = 1.0  # open thumb
-    if trigger > 0.5:
-        fingertips[4 + middle, 0, 3] = 1.0  # close middle
+    # The IK solver maps thumb-to-middle distance to a continuous hand target.
+    fingertips[4, 0, 3] = 1.0
+    fingertips[14, 0, 3] = np.clip(grip, 0.0, 1.0)
 
     return fingertips
 
@@ -749,6 +746,33 @@ def get_abxy_buttons(reader=None):
         return a_pressed, b_pressed, x_pressed, y_pressed
     except Exception:
         return False, False, False, False
+
+
+class RecordingButtons:
+    """Emit one event on a clean A or B release while the left trigger is held."""
+
+    def __init__(self):
+        self._ready = False
+        self._pending = None
+
+    def update(self, left_trigger, a, b, x, y):
+        trigger_down = left_trigger > 0.5
+        if not (a or b or x or y):
+            event = self._pending if trigger_down else None
+            self._pending = None
+            self._ready = trigger_down
+            return event == "A", event == "B"
+
+        button = None
+        if trigger_down and not (x or y) and a != b:
+            button = "A" if a else "B"
+
+        if self._ready:
+            self._pending = button
+        elif button != self._pending:
+            self._pending = None
+        self._ready = False
+        return False, False
 
 
 def compute_hand_joints_from_inputs(
@@ -1313,9 +1337,7 @@ class PoseStreamer:
         self.next_target_ns = None
         self.frame_start = time.time()
 
-        # Data collection button state tracking (edge-triggered)
-        self.toggle_data_collection_last = False
-        self.toggle_data_abort_last = False
+        self.recording_buttons = RecordingButtons()
 
         self.buffer_cleared = (
             True  # Start with buffer cleared - wait for full buffer before first send
@@ -1337,7 +1359,7 @@ class PoseStreamer:
         self.buffer_cleared = True
         self.step = 0
 
-    def run_once(self):
+    def run_once(self, recording_events=None):
         """Execute one iteration of the pose streaming loop."""
         sample = self.reader.get_latest()
 
@@ -1351,20 +1373,11 @@ class PoseStreamer:
         left_menu_button, left_trigger, right_trigger, left_grip, right_grip = get_controller_inputs(
             self.reader
         )
-        # Get A and B button states for data collection control
-        a_pressed, b_pressed, x_pressed, y_pressed = get_abxy_buttons(self.reader)
-
-        # Data collection toggle logic (edge-triggered)
-        # Left grip + A = toggle_data_collection
-        # Left grip + B = toggle_data_abort
-        toggle_data_collection_tmp = a_pressed and left_grip > 0.5
-        toggle_data_abort_tmp = b_pressed and left_grip > 0.5
-
-        # Detect rising edge
-        toggle_data_collection = toggle_data_collection_tmp and not self.toggle_data_collection_last
-        toggle_data_abort = toggle_data_abort_tmp and not self.toggle_data_abort_last
-        self.toggle_data_collection_last = toggle_data_collection_tmp
-        self.toggle_data_abort_last = toggle_data_abort_tmp
+        if recording_events is None:
+            recording_events = self.recording_buttons.update(
+                left_trigger, *get_abxy_buttons(self.reader)
+            )
+        toggle_data_collection, toggle_data_abort = recording_events
 
         left_hand_joints, right_hand_joints = compute_hand_joints_from_inputs(
             self.left_hand_ik_solver,
@@ -1983,8 +1996,7 @@ def run_pico_manager(
     # Track which mode VR_3PT was entered from, so left_axis_click returns to it.
     # Will be either PLANNER or PLANNER_FROZEN_UPPER_BODY.
     vr3pt_parent_mode = StreamMode.PLANNER
-    prev_toggle_dc = False
-    prev_toggle_da = False
+    recording_buttons = RecordingButtons()
     try:
         prev_ax_pressed = False
         prev_by_pressed = False
@@ -1994,7 +2006,10 @@ def run_pico_manager(
             # Poll Pico controller for buttons/axes
             a_pressed, b_pressed, x_pressed, y_pressed = get_abxy_buttons(reader)
 
-            left_menu_button, _, _, left_grip_mgr, _ = get_controller_inputs(reader)
+            left_menu_button, left_trigger, _, _, _ = get_controller_inputs(reader)
+            recording_events = recording_buttons.update(
+                left_trigger, a_pressed, b_pressed, x_pressed, y_pressed
+            )
 
             left_axis_click, _ = get_axis_clicks(reader)
 
@@ -2098,7 +2113,7 @@ def run_pico_manager(
 
             # Run one iteration of the new mode
             if new_mode == StreamMode.POSE:
-                pose_streamer.run_once()
+                pose_streamer.run_once(recording_events)
             elif (
                 new_mode == StreamMode.PLANNER
                 or new_mode == StreamMode.PLANNER_FROZEN_UPPER_BODY
@@ -2124,12 +2139,7 @@ def run_pico_manager(
                 current_mode = new_mode
 
             # Mode-independent: send manager_state for data exporter
-            toggle_dc_tmp = bool(a_pressed) and left_grip_mgr > 0.5
-            toggle_da_tmp = bool(b_pressed) and left_grip_mgr > 0.5
-            toggle_dc = toggle_dc_tmp and not prev_toggle_dc
-            toggle_da = toggle_da_tmp and not prev_toggle_da
-            prev_toggle_dc = toggle_dc_tmp
-            prev_toggle_da = toggle_da_tmp
+            toggle_dc, toggle_da = recording_events
             socket.send(
                 pack_pose_message(
                     {
