@@ -1,0 +1,66 @@
+# 外径30 mmのパイプ用。RH56DFQモデルから求めた初期姿勢。手の実測による調整は未実施。
+# grip はPICOの握り入力。屈曲は 1 = 開、0 = 閉。thumb_rotate は根元の正規化位置。
+# max_close_ratio = 1 を想定。円筒は40 mm版と同じ手のひら基準位置に置いた。
+# 角度専用。握り入力に応じた FORCE_SET の指定は省略。
+name: gripPipe30mm_no_force
+points:
+  - grip: 0.0  # 開いた状態
+    left:
+      pinky: 1.0
+      ring: 1.0
+      middle: 1.0
+      index: 1.0
+      thumb_bend: 1.0
+      thumb_rotate: 0.45
+    right:
+      pinky: 1.0
+      ring: 1.0
+      middle: 1.0
+      index: 1.0
+      thumb_bend: 1.0
+      thumb_rotate: 0.45
+  - grip: 0.2  # 親指の向きを先に整える
+    left:
+      pinky: 0.96
+      ring: 0.96
+      middle: 0.96
+      index: 0.96
+      thumb_bend: 0.98
+      thumb_rotate: 0.35
+    right:
+      pinky: 0.96
+      ring: 0.96
+      middle: 0.96
+      index: 0.96
+      thumb_bend: 0.98
+      thumb_rotate: 0.41
+  - grip: 0.8  # 4本指と親指を円筒に沿わせる
+    left:
+      pinky: 0.523
+      ring: 0.526
+      middle: 0.527
+      index: 0.537
+      thumb_bend: 0.55
+      thumb_rotate: 0.32
+    right:
+      pinky: 0.523
+      ring: 0.526
+      middle: 0.527
+      index: 0.538
+      thumb_bend: 0.563
+      thumb_rotate: 0.4
+  - grip: 1.0  # 30 mm円筒を包む
+    left:
+      pinky: 0.438
+      ring: 0.427
+      middle: 0.425
+      index: 0.425
+      thumb_bend: 0.411
+      thumb_rotate: 0.32
+    right:
+      pinky: 0.438
+      ring: 0.427
+      middle: 0.425
+      index: 0.429
+      thumb_bend: 0.414
+      thumb_rotate: 0.4

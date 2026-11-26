@@ -1,0 +1,65 @@
+# 外径40 mmのパイプを5本で包むための初期姿勢。実機では未調整。
+# RH56DFQモデルで直径40 mmの円筒に合わせた位置目標。max_close_ratio = 1 を想定。
+# grip はPICO入力。屈曲は 1 = 開、0 = 閉。thumb_rotate は根元の正規化位置。
+name: gripPipe
+points:
+  - grip: 0.0  # 開いた状態
+    left:
+      pinky: 1.0
+      ring: 1.0
+      middle: 1.0
+      index: 1.0
+      thumb_bend: 1.0
+      thumb_rotate: 0.45
+    right:
+      pinky: 1.0
+      ring: 1.0
+      middle: 1.0
+      index: 1.0
+      thumb_bend: 1.0
+      thumb_rotate: 0.45
+  - grip: 0.2  # 4本の指を開いたままに近い状態で、親指の向きを先に整える
+    left:
+      pinky: 0.96
+      ring: 0.96
+      middle: 0.96
+      index: 0.96
+      thumb_bend: 0.98
+      thumb_rotate: 0.16
+    right:
+      pinky: 0.96
+      ring: 0.96
+      middle: 0.96
+      index: 0.96
+      thumb_bend: 0.98
+      thumb_rotate: 0.16
+  - grip: 0.8  # 円筒に沿って指を丸める
+    left:
+      pinky: 0.57
+      ring: 0.57
+      middle: 0.57
+      index: 0.58
+      thumb_bend: 0.55
+      thumb_rotate: 0.12
+    right:
+      pinky: 0.57
+      ring: 0.57
+      middle: 0.57
+      index: 0.58
+      thumb_bend: 0.55
+      thumb_rotate: 0.12
+  - grip: 1.0  # 円筒の表面に近づける
+    left:
+      pinky: 0.494
+      ring: 0.481
+      middle: 0.478
+      index: 0.479
+      thumb_bend: 0.411
+      thumb_rotate: 0.12
+    right:
+      pinky: 0.494
+      ring: 0.481
+      middle: 0.478
+      index: 0.482
+      thumb_bend: 0.396
+      thumb_rotate: 0.12
